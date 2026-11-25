@@ -11290,6 +11290,10 @@ _STRUCTURE_CASES = [
      [("SCHEMA_VALIDATION_FAILED", "This object should have only one of the following fields: [Next, End]",
        "/States/A"),
       ("MISSING_END_STATE", "Workflow has no terminal state", None)]),
+    ({"StartAt": "X", "States": {}},
+     [("SCHEMA_VALIDATION_FAILED", "Value cannot be empty", "/States"),
+      ("MISSING_TRANSITION_TARGET", "Missing 'Next' target: X", "/StartAt"),
+      ("MISSING_END_STATE", "Workflow has no terminal state", None)]),
 ]
 
 

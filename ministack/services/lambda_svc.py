@@ -68,6 +68,7 @@ from ministack.core.lambda_runtime import (
     acquire_worker,
     ensure_spawned,
     execution_credentials,
+    host_process_env,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -2284,6 +2285,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
             return _get_event_invoke_config(fname, qualifier)
         if method == "PUT":
             return _put_event_invoke_config(fname, qualifier, data)
+        if method == "POST":
+            return _put_event_invoke_config(fname, qualifier, data, update=True)
         if method == "DELETE":
             return _delete_event_invoke_config(fname, qualifier)
 
@@ -3376,11 +3379,10 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     log_output = result.get("log", "")
     if log_output:
         logger.info("Lambda %s output:\n%s", name, log_output)
-        log_type = headers.get("x-amz-log-type") or headers.get("X-Amz-Log-Type") or "None"
-        if log_type.lower() == "tail":
-            resp_headers["X-Amz-Log-Result"] = base64.b64encode(
-                log_output.encode("utf-8")[-4096:],
-            ).decode()
+    tail = result.get("tail_log") or log_output
+    log_type = headers.get("x-amz-log-type") or headers.get("X-Amz-Log-Type") or "None"
+    if tail and log_type.lower() == "tail":
+        resp_headers["X-Amz-Log-Result"] = base64.b64encode(tail.encode("utf-8")[-4096:]).decode()
 
     # Throttling takes a separate status path: HTTP 429 with the error body
     # shaped as a service-level exception, NOT the 200+X-Amz-Function-Error
@@ -3870,22 +3872,32 @@ def invoke_async_with_retry(func: dict, event: dict) -> None:
         )
         started = time.time()
         last_result = None
-        for attempt in range(int(max_retries) + 1):
-            if attempt > 0:
+        attempt = 0
+        throttles = 0
+        while True:
+            last_result = _execute_function(func, event)
+            if last_result.get("throttle"):
+                # A throttled event goes back on the queue and is retried until it ages out, with a backoff that
+                # grows from the base; throttles do not count against MaximumRetryAttempts (Lambda async docs).
+                delay = min(_LAMBDA_ASYNC_RETRY_BASE_SECONDS * (2 ** throttles), _LAMBDA_ASYNC_RETRY_MAX_SECONDS)
+                throttles += 1
+            else:
+                log_output = last_result.get("log", "")
+                if log_output:
+                    logger.info("Lambda %s async output (attempt %d):\n%s", fn_name, attempt + 1, log_output)
+                if not last_result.get("error"):
+                    return
+                attempt += 1
+                if attempt > int(max_retries):
+                    break
                 # Exponential backoff: base, base*2, base*4, …, capped.
                 delay = min(_LAMBDA_ASYNC_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
                             _LAMBDA_ASYNC_RETRY_MAX_SECONDS)
-                # Age-gate: if retrying would push us past MaximumEventAgeInSeconds,
-                # give up now and route to DLQ (matches AWS's event-age expiry).
-                if (time.time() - started) + delay > max_event_age:
-                    break
-                time.sleep(delay)
-            last_result = _execute_function(func, event)
-            log_output = last_result.get("log", "")
-            if log_output:
-                logger.info("Lambda %s async output (attempt %d):\n%s", fn_name, attempt + 1, log_output)
-            if not last_result.get("error"):
-                return
+            # Age-gate: if retrying would push us past MaximumEventAgeInSeconds,
+            # give up now and route to DLQ (matches AWS's event-age expiry).
+            if (time.time() - started) + delay > max_event_age:
+                break
+            time.sleep(delay)
         if on_failure_arn and last_result is not None:
             _route_async_failure(on_failure_arn, fn_name, event, last_result)
 
@@ -5384,8 +5396,34 @@ def _probe_peak_memory_mb(func: dict) -> int:
         return 0
 
 
+def _platform_log_lines(func: dict, request_id: str, log_text: str, duration_ms: int,
+                        log_source: str | None) -> list[str]:
+    """The invocation's log as AWS writes it: the handler output between START, and END and REPORT."""
+    config = func.get("config") or func
+    start = f"START RequestId: {request_id} Version: {config.get('Version', '$LATEST')}"
+    end = f"END RequestId: {request_id}"
+
+    def _report():
+        return (f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
+                f"Billed Duration: {duration_ms} ms\tMemory Size: "
+                f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {_probe_peak_memory_mb(func)} MB")
+
+    if log_source == "rie" and log_text:
+        lines = log_text.splitlines()
+        # RIE prints START on every invoke but no END/REPORT when init or the invoke fails (502).
+        if not any(line.startswith(f"START RequestId: {request_id}") for line in lines):
+            lines.insert(0, start)
+        if not any(line.startswith(end) for line in lines):
+            lines.append(end)
+        if not any(line.startswith(f"REPORT RequestId: {request_id}") for line in lines):
+            lines.append(_report())
+        return lines
+    return [start, *(log_text.splitlines() if log_text else []), end, _report()]
+
+
 def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
-                      error: bool, duration_ms: int, *, log_source: str | None = None) -> None:
+                      error: bool, duration_ms: int, *, log_source: str | None = None,
+                      lines: list[str] | None = None) -> None:
     """Write handler output to CloudWatch Logs under /aws/lambda/{name}, matching AWS.
 
     - Log group `/aws/lambda/{FunctionName}` is auto-created on first write.
@@ -5428,26 +5466,7 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
                 "lastIngestionTime": None,
             }
         stream = group["streams"][stream_name]
-
-        start = f"START RequestId: {request_id} Version: {qualifier}"
-        end = f"END RequestId: {request_id}"
-
-        def _report():
-            return (f"REPORT RequestId: {request_id}\tDuration: {duration_ms} ms\t"
-                    f"Billed Duration: {duration_ms} ms\tMemory Size: "
-                    f"{config.get('MemorySize', 128)} MB\tMax Memory Used: {_probe_peak_memory_mb(func)} MB")
-
-        if log_source == "rie" and log_text:
-            lines = log_text.splitlines()
-            # RIE prints START on every invoke but no END/REPORT when init or the invoke fails (502).
-            if not any(line.startswith(f"START RequestId: {request_id}") for line in lines):
-                lines.insert(0, start)
-            if not any(line.startswith(end) for line in lines):
-                lines.append(end)
-            if not any(line.startswith(f"REPORT RequestId: {request_id}") for line in lines):
-                lines.append(_report())
-        else:
-            lines = [start, *(log_text.splitlines() if log_text else []), end, _report()]
+        lines = lines or _platform_log_lines(func, request_id, log_text, duration_ms, log_source)
         _cwl._append_log_events(stream, [
             {"timestamp": now_ms, "message": line, "ingestionTime": now_ms}
             for line in lines
@@ -5631,13 +5650,14 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     duration_ms = int((time.time() - started) * 1000)
     if isinstance(result, dict) and result.get("service_error"):
         return result  # the function never ran: no platform log lines
-    _emit_lambda_logs(
-        func, request_id,
-        result.get("log", "") if isinstance(result, dict) else "",
-        bool(result.get("error")) if isinstance(result, dict) else False,
-        duration_ms,
-        log_source=result.get("log_source") if isinstance(result, dict) else None,
-    )
+    if not isinstance(result, dict):
+        _emit_lambda_logs(func, request_id, "", False, duration_ms)
+        return result
+    lines = _platform_log_lines(func, request_id, result.get("log", ""), duration_ms, result.get("log_source"))
+    _emit_lambda_logs(func, request_id, result.get("log", ""), bool(result.get("error")), duration_ms,
+                      log_source=result.get("log_source"), lines=lines)
+    # LogType=Tail returns the same lines CloudWatch gets, START to REPORT (AWS capture).
+    result["tail_log"] = "\n".join(lines) + "\n"
     return result
 
 
@@ -5853,7 +5873,7 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
     retains its legacy spawn-time depth overlay instead of freezing it here.
     """
     env_vars = _runtime_env_vars(config)
-    proc_env = dict(os.environ)
+    proc_env = host_process_env()
     proc_env.update({
         "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
         "AWS_DEFAULT_REGION": get_region(),
@@ -6194,7 +6214,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
                 with open(wrapper_path, "w") as wf:
                     wf.write(_WRAPPER_SCRIPT)
 
-            env = dict(os.environ)
+            env = host_process_env()
             env.update(
                 {
                     "AWS_DEFAULT_REGION": get_region(),
@@ -7322,6 +7342,18 @@ def _event_invoke_config(func: dict, qualifier: str | None) -> dict | None:
     return None
 
 
+def _event_invoke_config_arn(func_name: str, qualifier: str | None) -> str:
+    return f"{_func_arn(func_name)}:{qualifier or '$LATEST'}"
+
+
+def _no_event_invoke_config(func_name: str, qualifier: str | None):
+    return error_response_json(
+        "ResourceNotFoundException",
+        f"The function {_event_invoke_config_arn(func_name, qualifier)} doesn't have an EventInvokeConfig",
+        404,
+    )
+
+
 def _get_event_invoke_config(func_name: str, qualifier: str | None = None):
     if func_name not in _functions:
         return error_response_json(
@@ -7333,16 +7365,14 @@ def _get_event_invoke_config(func_name: str, qualifier: str | None = None):
         return _function_qualifier_not_found(func_name, qualifier)
     eic = _event_invoke_config(_functions[func_name], qualifier)
     if not eic:
-        suffix = f":{qualifier}" if qualifier else ""
-        return error_response_json(
-            "ResourceNotFoundException",
-            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
-            404,
-        )
+        return _no_event_invoke_config(func_name, qualifier)
     return json_response(eic)
 
 
-def _put_event_invoke_config(func_name: str, qualifier: str | None, data: dict):
+_EVENT_INVOKE_SETTINGS = ("MaximumRetryAttempts", "MaximumEventAgeInSeconds", "DestinationConfig")
+
+
+def _put_event_invoke_config(func_name: str, qualifier: str | None, data: dict, *, update: bool = False):
     if func_name not in _functions:
         return error_response_json(
             "ResourceNotFoundException",
@@ -7351,27 +7381,24 @@ def _put_event_invoke_config(func_name: str, qualifier: str | None, data: dict):
         )
     if not _function_qualifier_exists(_functions[func_name], qualifier):
         return _function_qualifier_not_found(func_name, qualifier)
-    destination_config = data.get(
-        "DestinationConfig",
-        {
-            "OnSuccess": {},
-            "OnFailure": {},
-        },
-    )
-    err = _validate_destination_config(destination_config)
+    if not any(data.get(k) is not None for k in _EVENT_INVOKE_SETTINGS):
+        return _invalid_parameter_value("You must specify at least one of error handling or destination setting.")
+    err = _validate_destination_config(data.get("DestinationConfig"))
     if err:
         return err
-    function_arn = _func_arn(func_name)
-    if qualifier:
-        function_arn = f"{function_arn}:{qualifier}"
-    eic = {
-        "FunctionArn": function_arn,
-        "MaximumRetryAttempts": data.get("MaximumRetryAttempts", 2),
-        "MaximumEventAgeInSeconds": data.get("MaximumEventAgeInSeconds", 21600),
-        "LastModified": int(time.time()),
-        "DestinationConfig": destination_config,
-    }
     func = _functions[func_name]
+    current = _event_invoke_config(func, qualifier)
+    if update and not current:
+        return _no_event_invoke_config(func_name, qualifier)
+    # Put replaces the configuration and Update merges into it; a setting never given is left out (AWS capture).
+    base = {k: v for k, v in (current or {}).items() if k in _EVENT_INVOKE_SETTINGS} if update else {}
+    base.update({k: data[k] for k in _EVENT_INVOKE_SETTINGS if data.get(k) is not None})
+    eic = {
+        "LastModified": int(time.time()),
+        "FunctionArn": _event_invoke_config_arn(func_name, qualifier),
+        **{k: base[k] for k in ("MaximumRetryAttempts", "MaximumEventAgeInSeconds") if k in base},
+        "DestinationConfig": base.get("DestinationConfig") or {"OnSuccess": {}, "OnFailure": {}},
+    }
     func.setdefault("event_invoke_configs", {})[qualifier or ""] = eic
     if not qualifier:
         func["event_invoke_config"] = eic
@@ -7391,12 +7418,7 @@ def _delete_event_invoke_config(func_name: str, qualifier: str | None = None):
     configs = func.setdefault("event_invoke_configs", {})
     key = qualifier or ""
     if key not in configs and not (not qualifier and func.get("event_invoke_config")):
-        suffix = f":{qualifier}" if qualifier else ""
-        return error_response_json(
-            "ResourceNotFoundException",
-            f"The function {func_name}{suffix} doesn't have an EventInvokeConfig",
-            404,
-        )
+        return _no_event_invoke_config(func_name, qualifier)
     configs.pop(key, None)
     if not qualifier:
         func["event_invoke_config"] = None

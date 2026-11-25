@@ -8195,6 +8195,25 @@ def test_dynamodb_table_name_units(ddb):
         f"1 validation error detected: Value '{two_emoji}' at 'tableName' failed to satisfy constraint: {pattern}")
 
 
+@pytest.mark.parametrize("expr,token,near", [
+    ("SET = 1", "=", "SET = 1"), ("SET a =", "<EOF>", "="), ("SET a = 1,", "1", "= 1,"), ("SET", "<EOF>", "SET"),
+    ("SET = :v", "=", "SET = :v"), ("REMOVE", "<EOF>", "REMOVE"), ("ADD = :v", "=", "ADD = :v"),
+])
+def test_dynamodb_update_expression_syntax_errors(ddb, expr, token, near):
+    """A malformed UpdateExpression is refused at the token the parser stops at (AWS capture, 2026-11-25)."""
+    name = _composite_table(ddb, "us")
+    try:
+        kwargs = {"ExpressionAttributeValues": {":v": {"N": "1"}}} if ":v" in expr else {}
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(TableName=name, Key={"pk": {"S": "p"}, "sk": {"S": "s"}}, UpdateExpression=expr, **kwargs)
+        assert exc.value.response["Error"] == {
+            "Code": "ValidationException",
+            "Message": f'1 validation error detected: Invalid UpdateExpression: Syntax error; token: "{token}", '
+                       f'near: "{near}"'}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_leading_underscore_in_expression(ddb):
     name = _composite_table(ddb, "us")
     try:

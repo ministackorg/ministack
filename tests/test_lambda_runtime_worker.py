@@ -340,6 +340,24 @@ def test_node_worker_cwd_is_code_dir():
     assert os.path.realpath(result["result"]["cwd"]) == os.path.realpath(result["result"]["root"])
 
 
+def test_python_worker_does_not_see_the_host_environment(monkeypatch):
+    """A function sees its runtime's variables, not MiniStack's; LANG and TZ are AWS's (AWS capture, 2026-11-25)."""
+    monkeypatch.setenv("MINISTACK_HOST_CANARY", "leaked")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", "import os\n\ndef handler(event, context):\n"
+                                     "    return {k: os.environ.get(k) for k in ('MINISTACK_HOST_CANARY', 'LANG', 'TZ')}\n")
+    worker = Worker("test-fn", _config(), buf.getvalue())
+    try:
+        result = worker.invoke({}, request_id="env-request-id")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok", result
+    assert result["result"] == {"MINISTACK_HOST_CANARY": None, "LANG": "en_US.UTF-8",
+                                "TZ": None if os.name == "nt" else ":UTC"}
+
+
 def test_python_worker_cwd_is_code_dir():
     """os.getcwd() must be the extracted code root, as on AWS (LAMBDA_TASK_ROOT)."""
     buf = io.BytesIO()

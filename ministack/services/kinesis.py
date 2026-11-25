@@ -402,6 +402,25 @@ def _copy_without_epoch_tags(buf, i, out):
     return i + 1
 
 
+_TIMESTAMP_MEMBERS = frozenset({
+    "ApproximateArrivalTimestamp", "ChannelCreationTimestamp", "ConsumerCreationTimestamp", "EarliestAllowedEndAt",
+    "EndedAt", "StartedAt", "StreamCreationTimestamp", "Timestamp",
+})
+
+
+def _cbor_timestamps(value, incoming=False):
+    """CBOR payload timestamps are tag 1 over integer epoch milliseconds, as the Java SDK v2 reads and writes them."""
+    import cbor2
+
+    if isinstance(value, dict):
+        return {k: (v / 1000 if incoming else cbor2.CBORTag(1, round(v * 1000)))
+                if k in _TIMESTAMP_MEMBERS and isinstance(v, (int, float)) and not isinstance(v, bool)
+                else _cbor_timestamps(v, incoming) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_cbor_timestamps(v, incoming) for v in value]
+    return value
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
@@ -414,7 +433,8 @@ async def handle_request(method, path, headers, body, query_params):
             import cbor2
             out = bytearray()
             _copy_without_epoch_tags(body, 0, out)
-            data = cbor2.loads(bytes(out))
+            # Request timestamps arrive as epoch milliseconds; the handlers take seconds, as in JSON.
+            data = _cbor_timestamps(cbor2.loads(bytes(out)), incoming=True)
             # CBOR Data field arrives as raw bytes; base64-encode for uniform handling
             if "Data" in data and isinstance(data["Data"], (bytes, bytearray)):
                 data["Data"] = base64.b64encode(data["Data"]).decode("ascii")
@@ -480,7 +500,7 @@ async def handle_request(method, path, headers, body, query_params):
             json_data = json.loads(resp_body) if isinstance(resp_body, (str, bytes)) else resp_body
         except (json.JSONDecodeError, TypeError):
             json_data = {}
-        cbor_body = cbor2.dumps(json_data)
+        cbor_body = cbor2.dumps(_cbor_timestamps(json_data))
         resp_headers["Content-Type"] = "application/x-amz-cbor-1.1"
         return status, resp_headers, cbor_body
     return status, resp_headers, resp_body
@@ -1314,7 +1334,7 @@ def _subscribe_to_shard(data, is_cbor):
     def encode(payload):
         if is_cbor:
             import cbor2
-            return cbor2.dumps(payload)
+            return cbor2.dumps(_cbor_timestamps(payload))
         return json.dumps(payload).encode()
 
     def event(event_type, payload):

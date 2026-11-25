@@ -3306,6 +3306,7 @@ class TestLiveProxy:
             conn.close()
 
     def test_create_index_async_returns_job(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
         conn = _pg_connect(dsql_proxy)
         try:
             cur = conn.cursor()
@@ -3330,10 +3331,11 @@ class TestLiveProxy:
             )
             assert cur.fetchall() == [(job_id, "completed")]
 
-            cur.execute(f"SELECT sys.wait_for_job(job_id) '{job_id}'")
+            cur.execute(f"CALL sys.wait_for_job(job_id) '{job_id}'")
             assert cur.fetchone()[0] is True
-            cur.execute("SELECT sys.wait_for_job(job_id) 'nonexistent'")
-            assert cur.fetchone()[0] is False
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("CALL sys.wait_for_job(job_id) 'nonexistent'")
+            assert exc.value.pgcode == "22P02"
 
             # The rewritten (sync) index really exists on the backend.
             cur.execute(
@@ -3429,9 +3431,20 @@ class TestLiveProxy:
                 "ALTER TABLE fka_child ADD CONSTRAINT fk "
                 "FOREIGN KEY (p) REFERENCES fka_parent NOT VALID"
             )
+            # Only the ASYNC form validates a constraint (real DSQL, 2026-11-25).
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute("ALTER TABLE fka_child VALIDATE CONSTRAINT fk")
+            assert exc.value.pgcode == "0A000"
+            assert "unsupported ALTER TABLE VALIDATE CONSTRAINT statement" in str(exc.value)
             # Async validation of a NOT VALID foreign key registers a job.
             cur.execute("ALTER TABLE ASYNC fka_child VALIDATE CONSTRAINT fk")
             job_id = cur.fetchone()[0]
+            # wait_for_job is a procedure: SELECT refuses it with a hint to CALL it.
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            assert exc.value.pgcode == "42809"
+            assert exc.value.diag.message_primary == "sys.wait_for_job(unknown) is a procedure"
+            assert exc.value.diag.message_hint == "To call a procedure, use CALL."
             cur.execute(
                 "SELECT job_type, status FROM sys.jobs WHERE job_id = %s" % repr(job_id)
             )
@@ -3483,7 +3496,7 @@ class TestLiveProxy:
             cur.execute("CREATE TABLE expr_live (id int, title text)")
             cur.execute("CREATE INDEX ASYNC ei_live ON expr_live (lower(title))")
             job_id = cur.fetchone()[0]
-            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            cur.execute(f"CALL sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is True
             cur.execute("DROP TABLE expr_live")
         finally:
@@ -3499,7 +3512,7 @@ class TestLiveProxy:
                 "CREATE INDEX ASYNC pi_live_high ON pi_live (title) WHERE rating > 5"
             )
             job_id = cur.fetchone()[0]
-            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            cur.execute(f"CALL sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is True
             cur.execute(
                 "SELECT pg_get_expr(indpred, indrelid) FROM pg_index "
@@ -3523,7 +3536,7 @@ class TestLiveProxy:
                 "WHERE NOT archived"
             )
             job_id = cur.fetchone()[0]
-            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            cur.execute(f"CALL sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is True
             # Duplicates are fine among archived rows...
             cur.execute(
@@ -3729,7 +3742,7 @@ class TestLiveProxy:
             status, details = cur.fetchone()
             assert status == "failed"
             assert "violates foreign key constraint" in details
-            cur.execute(f"SELECT sys.wait_for_job('{job_id}')")
+            cur.execute(f"CALL sys.wait_for_job('{job_id}')")
             assert cur.fetchone()[0] is False
             # A NOT VALID constraint still holds against new rows.
             with pytest.raises(psycopg2.Error) as exc:

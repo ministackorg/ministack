@@ -41,6 +41,7 @@ from ministack.services import s3 as _s3_mod
 from ministack.services import sts as _sts_mod
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+_MIN_PART = 5 * 1024 * 1024
 
 # Last-Modified on S3 HTTP responses must be RFC 7231 HTTP-date (AWS / Smithy).
 _RFC7231_LAST_MODIFIED_RE = re.compile(
@@ -598,7 +599,7 @@ def test_s3_multipart_upload(s3):
         Key=key,
         UploadId=upload_id,
         PartNumber=1,
-        Body=b"A" * 100,
+        Body=b"A" * _MIN_PART,
     )
     p2 = s3.upload_part(
         Bucket=bkt,
@@ -620,7 +621,34 @@ def test_s3_multipart_upload(s3):
         },
     )
     resp = s3.get_object(Bucket=bkt, Key=key)
-    assert resp["Body"].read() == b"A" * 100 + b"B" * 100
+    assert resp["Body"].read() == b"A" * _MIN_PART + b"B" * 100
+
+
+def test_s3_multipart_part_below_5_mib_is_entity_too_small(s3):
+    """Every part but the last one listed is at least 5 MiB; a smaller one fails the completion and the upload
+    stays open (AWS capture, 2026-11-25)."""
+    bkt = "intg-s3-mpu-too-small"
+    s3.create_bucket(Bucket=bkt)
+
+    def upload(key, sizes):
+        uid = s3.create_multipart_upload(Bucket=bkt, Key=key)["UploadId"]
+        parts = [{"PartNumber": n, "ETag": s3.upload_part(Bucket=bkt, Key=key, UploadId=uid, PartNumber=n,
+                                                          Body=b"x" * size)["ETag"]} for n, size in enumerate(sizes, 1)]
+        return uid, parts
+
+    uid, parts = upload("small", [_MIN_PART, 1024, 1024])
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bkt, Key="small", UploadId=uid, MultipartUpload={"Parts": parts})
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err == {"Code": "EntityTooSmall", "Message": "Your proposed upload is smaller than the minimum allowed size",
+                   "ProposedSize": "1024", "MinSizeAllowed": "5242880", "PartNumber": "2",
+                   "ETag": parts[1]["ETag"].strip('"')}
+    assert len(s3.list_parts(Bucket=bkt, Key="small", UploadId=uid)["Parts"]) == 3
+    # The last part listed may be small, even when parts after it were uploaded.
+    s3.complete_multipart_upload(Bucket=bkt, Key="small", UploadId=uid, MultipartUpload={"Parts": parts[:2]})
+    uid, parts = upload("one", [1024])
+    s3.complete_multipart_upload(Bucket=bkt, Key="one", UploadId=uid, MultipartUpload={"Parts": parts})
 
 def test_s3_abort_multipart_upload(s3):
     bkt = "intg-s3-abortmpu"
@@ -4472,7 +4500,7 @@ def test_s3_multipart_list_parts(s3):
         Key="big.bin",
         UploadId=uid,
         PartNumber=1,
-        Body=b"A" * 50,
+        Body=b"A" * _MIN_PART,
     )
     p2 = s3.upload_part(
         Bucket="qa-s3-listparts",
@@ -6718,7 +6746,7 @@ def test_s3_get_object_part_number(s3):
     bucket = "intg-s3-get-partnumber"
     s3.create_bucket(Bucket=bucket)
     uid = s3.create_multipart_upload(Bucket=bucket, Key="k")["UploadId"]
-    p1 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"A" * 100)
+    p1 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=1, Body=b"A" * _MIN_PART)
     p2 = s3.upload_part(Bucket=bucket, Key="k", UploadId=uid, PartNumber=2, Body=b"B" * 50)
     s3.complete_multipart_upload(
         Bucket=bucket, Key="k", UploadId=uid,
@@ -6730,8 +6758,8 @@ def test_s3_get_object_part_number(s3):
     g = s3.get_object(Bucket=bucket, Key="k", PartNumber=1)
     assert g["ResponseMetadata"]["HTTPStatusCode"] == 206
     assert g["PartsCount"] == 2
-    assert g["ContentLength"] == 100
-    assert g["Body"].read() == b"A" * 100
+    assert g["ContentLength"] == _MIN_PART
+    assert g["Body"].read() == b"A" * _MIN_PART
 
 
 def test_s3_list_object_versions_pagination_markers(s3):

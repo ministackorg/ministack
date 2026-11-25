@@ -401,6 +401,9 @@ _object_tags = AccountScopedDict()
 _object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
 _object_annotations = AccountScopedDict()
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
+# (bucket, key) -> {removed version id: id of the version just older than it, or None}, so a
+# ListObjectVersions VersionIdMarker that names a removed version still resumes below it.
+_removed_versions = AccountScopedDict()
 
 _bucket_object_lock = AccountScopedDict()
 _bucket_replication = AccountScopedDict()
@@ -1941,6 +1944,8 @@ def _parse_range(range_header: str, total: int):
         suffix = int(e)
         if suffix == 0:
             return None
+        if total == 0:
+            return ()
         start = max(0, total - suffix)
         return start, total - 1
     start = int(s)
@@ -3452,6 +3457,8 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _removed_versions if k[0] == name]:
+        del _removed_versions[k]
     for k in [k for k in _object_annotations if k[0] == name]:
         del _object_annotations[k]
     for k in [k for k in _object_acl if k[0] == name]:
@@ -3653,8 +3660,40 @@ def _put_bucket_encryption(name: str, body: bytes):
         return _error("MalformedXML", _MALFORMED_XML, 400)
     if any(el.tag.rsplit("}", 1)[-1] == "SSEAlgorithm" and el.text not in _SSE_ALGORITHMS for el in root.iter()):
         return _error("MalformedXML", _MALFORMED_XML, 400)
+    if not _encryption_config_well_formed(root):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     _bucket_encryption[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
+
+
+# Children each element of a ServerSideEncryptionConfiguration may hold (botocore s3 model).
+_ENCRYPTION_CONFIG_CHILDREN = {
+    "Rule": {"ApplyServerSideEncryptionByDefault", "BucketKeyEnabled", "BlockedEncryptionTypes"},
+    "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm", "KMSMasterKeyID"},
+    "BlockedEncryptionTypes": {"EncryptionType"},
+}
+
+
+def _encryption_config_well_formed(root) -> bool:
+    """Exactly one Rule, no element outside the schema, and an SSEAlgorithm in every
+    ApplyServerSideEncryptionByDefault. S3 refuses anything else as MalformedXML."""
+    def local(el):
+        return el.tag.rsplit("}", 1)[-1]
+
+    rules = list(root)
+    if local(root) != "ServerSideEncryptionConfiguration" or len(rules) != 1 or local(rules[0]) != "Rule":
+        return False
+    stack = [rules[0]]
+    while stack:
+        el = stack.pop()
+        allowed = _ENCRYPTION_CONFIG_CHILDREN.get(local(el), set())
+        children = [local(c) for c in el]
+        if any(c not in allowed for c in children):
+            return False
+        if local(el) == "ApplyServerSideEncryptionByDefault" and "SSEAlgorithm" not in children:
+            return False
+        stack.extend(c for c in el if local(c) in _ENCRYPTION_CONFIG_CHILDREN)
+    return True
 
 
 def _delete_bucket_encryption(name: str):
@@ -4451,6 +4490,20 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     key_marker = _qp(query_params, "key-marker", "")
     version_id_marker = _qp(query_params, "version-id-marker", "")
     max_keys = int(_qp(query_params, "max-keys", "1000"))
+    if version_id_marker and not key_marker:
+        return _error("InvalidArgument", "A version-id marker cannot be specified without a key marker.", 400)
+    # Where the listing resumes within key-marker: after the marker when it is still there, or
+    # from the first surviving version older than it when it was removed (None: nothing older).
+    resume_at, resume_inclusive = version_id_marker, False
+    if version_id_marker and version_id_marker != "null":
+        live = {v["version_id"] for v in _object_versions.get((bucket_name, key_marker)) or []}
+        removed = _removed_versions.get((bucket_name, key_marker)) or {}
+        if version_id_marker not in live and version_id_marker not in removed:
+            return _error("InvalidArgument", "Invalid version id specified", 400)
+        seen = set()
+        while resume_at is not None and resume_at not in live and resume_at not in seen:
+            seen.add(resume_at)
+            resume_at, resume_inclusive = removed.get(resume_at), True
 
     root = Element("ListVersionsResult", xmlns=S3_NS)
     SubElement(root, "Name").text = bucket_name
@@ -4548,11 +4601,15 @@ def _list_object_versions(bucket_name: str, query_params: dict):
             # supplied version-id-marker (versions are stored oldest-first, so
             # newest-first iteration matches the S3 listing order).
             skipping = bool(version_id_marker and k == key_marker)
+            if skipping and resume_at is None:
+                continue
             for v in reversed(versions):
                 if skipping:
-                    if v["version_id"] == version_id_marker:
-                        skipping = False
-                    continue
+                    if v["version_id"] != resume_at:
+                        continue
+                    skipping = False
+                    if not resume_inclusive:
+                        continue
                 if count >= max_keys:
                     is_truncated = True
                     break
@@ -5958,6 +6015,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
                 },
                 _xml_body(_range_error_xml(bucket_name, key)),
             )
+    if range_header and rng:
         start, end = rng
         slice_body = body[start : end + 1]
         resp_headers["Content-Length"] = str(len(slice_body))
@@ -6574,6 +6632,7 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
         return False, False
 
     removed = versions.pop(idx)
+    _removed_versions.setdefault(vkey, {})[version_id] = versions[idx - 1]["version_id"] if idx else None
     _delete_version_file(bucket_name, key, version_id)
     was_delete_marker = bool(removed.get("is_delete_marker"))
     # Per-version tags and ACLs travel with the version being removed.
@@ -6645,6 +6704,11 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
     # absent key is not an already-completed delete either: the request is
     # conditional, and there is nothing for the condition to hold against.
     if_match = (headers.get("if-match") or "").strip()
+    # A condition together with a VersionId is not supported on a general-purpose bucket:
+    # S3 answers 501 naming the header and deletes nothing.
+    if if_match and _qp(query_params, "versionId", ""):
+        return _object_error("NotImplemented", "A header you provided implies functionality that is not implemented",
+                             501, Header="If-Match")
     if if_match:
         _cur = bucket["objects"].get(key)
         if _cur is None:
@@ -8835,6 +8899,16 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
 
         etag_el = _find_xml_tag(obj_el, "ETag")
         cond_etag = etag_el.text if (etag_el is not None and etag_el.text) else ""
+        if cond_etag and version_id:
+            errors.append(
+                {
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "NotImplemented",
+                    "msg": "A header you provided implies functionality that is not implemented",
+                }
+            )
+            continue
         if cond_etag:
             _cur = bucket["objects"].get(k)
             if _cur is None:
@@ -9175,6 +9249,9 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     return 200, resp_headers, _xml_body(root)
 
 
+_MIN_PART_SIZE = 5 * 1024 * 1024
+
+
 def _complete_multipart_upload(
     bucket_name: str, key: str, body: bytes, query_params: dict, headers: dict | None = None
 ):
@@ -9281,6 +9358,11 @@ def _complete_multipart_upload(
                     "The following part numbers are invalid: " + str(pn),
                     400,
                 )
+        if len(stored["body"]) < _MIN_PART_SIZE and pn != ordered_parts[-1][0]:
+            # Every part but the last listed is at least 5 MiB; the upload stays open (AWS capture).
+            return _object_error("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed size", 400,
+                                 ProposedSize=str(len(stored["body"])), MinSizeAllowed=str(_MIN_PART_SIZE),
+                                 PartNumber=str(pn), ETag=stored["etag"].strip('"'))
         if checksum_algorithm:
             part_digests.append(stored_checksums.get(checksum_algorithm))
         md5_digests += hashlib.md5(stored["body"]).digest()
@@ -9443,18 +9525,36 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
             continue
         if prefix and not upload["key"].startswith(prefix):
             continue
+        # Without an upload-id-marker the key-marker itself is excluded; with one, only
+        # the key-marker's uploads after that id are kept.
         if key_marker and upload["key"] < key_marker:
             continue
-        if key_marker and upload["key"] == key_marker and upload_id_marker and uid <= upload_id_marker:
+        if key_marker and upload["key"] == key_marker and (not upload_id_marker or uid <= upload_id_marker):
             continue
         uploads.append((uid, upload))
 
-    uploads.sort(key=lambda x: (x[1]["key"], x[0]))
+    # A delimiter after the prefix folds the key into a CommonPrefixes entry. Each prefix
+    # counts once against max-uploads, in key order with the uploads.
+    entries = []
+    folded = set()
+    for uid, upload in sorted(uploads, key=lambda x: (x[1]["key"], x[0])):
+        cut = upload["key"].find(delimiter, len(prefix)) if delimiter else -1
+        if cut == -1:
+            entries.append((upload["key"], uid, upload))
+            continue
+        group = upload["key"][: cut + len(delimiter)]
+        if group not in folded:
+            folded.add(group)
+            entries.append((group, None, None))
+    entries.sort(key=lambda e: e[0])
 
-    is_truncated = len(uploads) > max_uploads
+    is_truncated = len(entries) > max_uploads
     SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
 
-    for uid, upload in uploads[:max_uploads]:
+    page = entries[:max_uploads]
+    for key, uid, upload in page:
+        if upload is None:
+            continue
         u = SubElement(root, "Upload")
         SubElement(u, "Key").text = upload["key"]
         SubElement(u, "UploadId").text = uid
@@ -9466,11 +9566,15 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
         SubElement(owner, "DisplayName").text = "ministack"
         SubElement(u, "StorageClass").text = upload.get("storage_class") or "STANDARD"
         SubElement(u, "Initiated").text = upload["created"]
+    for key, uid, upload in page:
+        if upload is None:
+            SubElement(SubElement(root, "CommonPrefixes"), "Prefix").text = key
 
-    if is_truncated and uploads:
-        last = uploads[max_uploads - 1]
-        SubElement(root, "NextKeyMarker").text = last[1]["key"]
-        SubElement(root, "NextUploadIdMarker").text = last[0]
+    if is_truncated:
+        # The markers name the page's last upload; a common prefix never advances them.
+        last = next((e for e in reversed(page) if e[2] is not None), None)
+        SubElement(root, "NextKeyMarker").text = last[0] if last else ""
+        SubElement(root, "NextUploadIdMarker").text = last[1] if last else ""
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -9987,7 +10091,8 @@ def _persisted_key_files(bucket_path, sidecars):
         for fname in filenames:
             if fname.endswith(".meta.json") == sidecars and not fname.endswith(".tmp"):
                 path = os.path.join(dirpath, fname)
-                key = os.path.relpath(path[: -len(".meta.json")] if sidecars else path, bucket_path)
+                # The key's "/" are directory separators on disk; Windows hands them back as "\\".
+                key = os.path.relpath(path[: -len(".meta.json")] if sidecars else path, bucket_path).replace(os.sep, "/")
                 yield path, key
     encoded_dir = os.path.join(bucket_path, _ENCODED_KEYS_DIR)
     for fname in sorted(os.listdir(encoded_dir)) if os.path.isdir(encoded_dir) else []:
@@ -10911,7 +11016,7 @@ def reset():
     global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
-    global _object_tags, _multipart_uploads, _object_versions, _object_acl, _object_annotations
+    global _object_tags, _multipart_uploads, _object_versions, _object_acl, _object_annotations, _removed_versions
     global _bucket_object_lock, _bucket_replication, _object_retention, _object_legal_hold
     for d in (
         _buckets,
@@ -10937,6 +11042,7 @@ def reset():
         _object_retention,
         _object_legal_hold,
         _object_versions,
+        _removed_versions,
         _mraps,
         _mrap_operations,
         _access_points,
