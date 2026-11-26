@@ -2824,3 +2824,293 @@ def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
         assert json.loads(exc.value.read())["errors"][0]["errorType"] == "MalformedHttpRequestException"
     finally:
         appsync.delete_graphql_api(apiId=api_id)
+
+
+_DEPTH_SDL = """
+type Node { id: ID child: Node }
+type Query { node: Node }
+"""
+
+_DEPTH_LIMIT_REACHED = {
+    "path": [], "data": None, "errorType": "QueryDepthLimitReached", "errorInfo": None,
+    "locations": [], "message": "Query depth limit reached.",
+}
+
+
+def _depth_api(appsync, limit):
+    """An API whose Query.node returns a chain of seven nodes, n1 to n7."""
+    kwargs = {"queryDepthLimit": limit} if limit else {}
+    api_id = appsync.create_graphql_api(
+        name="gql-depth", authenticationType="API_KEY", **kwargs)["graphqlApi"]["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    appsync.start_schema_creation(apiId=api_id, definition=_DEPTH_SDL.encode())
+    appsync.create_data_source(apiId=api_id, name="DS", type="NONE")
+    _js_resolver(appsync, api_id, "node", """
+        export function request(ctx) {
+          return { payload: { id: "n1", child: { id: "n2", child: { id: "n3", child: { id: "n4", child: {
+            id: "n5", child: { id: "n6", child: { id: "n7" } } } } } } } };
+        }
+        export function response(ctx) { return ctx.result; }
+    """)
+    return api_id, key
+
+
+def _graphql_operation(api_id, key, query, operation_name=None):
+    body = {"query": query, **({"operationName": operation_name} if operation_name else {})}
+    req = urllib.request.Request(
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "x-api-key": key})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, json.loads(r.read())
+
+
+_CUT = {"errors": [_DEPTH_LIMIT_REACHED]}
+
+
+@pytest.mark.parametrize("query, operation_name, expected", [
+    ("{ node { id } }", None, {"data": {"node": {"id": "n1"}}}),
+    ("{ node { child { id } } }", None, {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("{ node { child { child { id } } } }", None,
+     {"data": {"node": {"child": {"child": {"id": None}}}}, **_CUT}),
+    ("{ node { child { child { child { id } } } } }", None,
+     {"data": {"node": {"child": {"child": {"child": None}}}}, **_CUT}),
+    # A fragment spread and an inline fragment add no level of their own.
+    ("query { node { ...F } } fragment F on Node { child { id } }", None,
+     {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("{ node { ... on Node { child { id } } } }", None, {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("query { node { ...F } } fragment F on Node { child { child { id } } }", None,
+     {"data": {"node": {"child": {"child": {"id": None}}}}, **_CUT}),
+    # Only the selected operation counts.
+    ("query A { node { id } } query B { node { child { child { child { id } } } } }", "A",
+     {"data": {"node": {"id": "n1"}}}),
+    ("query A { node { id } } query B { node { child { child { child { id } } } } }", "B",
+     {"data": {"node": {"child": {"child": {"child": None}}}}, **_CUT}),
+], ids=["depth-2", "depth-3", "depth-4", "depth-5", "fragment-spread", "inline-fragment", "fragment-over-limit",
+        "operation-a", "operation-b"])
+def test_appsync_graphql_query_depth_limit_cuts_the_selection(appsync, query, operation_name, expected):
+    """Fields within queryDepthLimit resolve, the ones below it are null and one QueryDepthLimitReached
+    error is added to the answer."""
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        assert _graphql_operation(api_id, key, query, operation_name) == (200, expected)
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15, 0], ids=["limit-14", "limit-15", "no-limit"])
+def test_appsync_graphql_query_within_the_depth_limit_is_answered(appsync, limit):
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, "{ node { child { child { child { id } } } } }")
+        assert (status, out) == (200, {"data": {"node": {"child": {"child": {"child": {"id": "n4"}}}}}})
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+_NESTED_TYPE_QUERY = '{ __type(name: "Query") { fields { type { fields { type { fields { type { fields { name } } } } } } } } }'
+
+
+def test_appsync_graphql_introspection_counts_toward_the_depth_limit(appsync):
+    """AppSync has no introspection-specific depth rule: the nested __type query, nine levels deep, is
+    answered up to the API's queryDepthLimit and cut below it like any other selection."""
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        status, out = _graphql_operation(api_id, key, _NESTED_TYPE_QUERY)
+        assert status == 200
+        assert out == {"data": {"__type": {"fields": [{"type": {"fields": None}}]}}, **_CUT}
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15, 0], ids=["limit-14", "limit-15", "no-limit"])
+def test_appsync_graphql_nested_introspection_within_the_limit_is_answered(appsync, limit):
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, _NESTED_TYPE_QUERY)
+        assert status == 200
+        assert "errors" not in out, out
+        deepest = out["data"]["__type"]["fields"][0]["type"]["fields"][1]["type"]["fields"][1]["type"]["fields"]
+        assert deepest == [{"name": "id"}, {"name": "child"}]
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15], ids=["limit-14", "limit-15"])
+def test_appsync_graphql_standard_introspection_query_is_answered(appsync, limit):
+    from graphql import get_introspection_query
+
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, get_introspection_query())
+        assert status == 200
+        assert "errors" not in out, out
+        assert out["data"]["__schema"]["queryType"]["name"] == "Query"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_standard_introspection_query_is_cut_by_a_low_limit(appsync):
+    from graphql import get_introspection_query
+
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        status, out = _graphql_operation(api_id, key, get_introspection_query())
+        assert status == 200
+        assert out["errors"][0] == _DEPTH_LIMIT_REACHED
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+_UNSET_VARIABLES_SDL = """
+type Query { echo(a: String, b: String): AWSJSON }
+"""
+
+
+def _echo_arguments_api(appsync, name):
+    """An API whose Query.echo returns the arguments its resolver received, as JSON."""
+    api_id, key = _js_api(appsync, name)
+    appsync.start_schema_creation(apiId=api_id, definition=_UNSET_VARIABLES_SDL.encode())
+    _js_resolver(appsync, api_id, "echo", """
+        export function request(ctx) { return { payload: ctx.arguments } }
+        export function response(ctx) { return JSON.stringify(ctx.result) }
+    """)
+    return api_id, key
+
+
+@pytest.mark.parametrize("variables, query, expected", [
+    # A declared variable the request does not send reaches the resolver as null.
+    ({"a": "x"}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": "x", "b": None}),
+    ({}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": None, "b": None}),
+    # An argument the document does not pass at all stays absent.
+    ({"a": "x"}, "query Q($a: String) { echo(a: $a) }", {"a": "x"}),
+    ({}, "query Q { echo(a: \"x\") }", {"a": "x"}),
+    # A default value is kept.
+    ({}, 'query Q($a: String, $b: String = "d") { echo(a: $a, b: $b) }', {"a": None, "b": "d"}),
+    # An explicit null stays null.
+    ({"a": "x", "b": None}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": "x", "b": None}),
+], ids=["one-unset", "all-unset", "arg-not-passed", "no-variables", "default-kept", "explicit-null"])
+def test_appsync_graphql_declared_unset_variable_is_null_in_arguments(appsync, variables, query, expected):
+    """AppSync passes every variable the operation declares, the request does not send and that has no
+    default to the resolver as null; an argument is absent only when the document does not pass it."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-variables")
+    try:
+        out = _graphql(api_id, key, query, variables)
+        assert "errors" not in out, out
+        assert json.loads(out["data"]["echo"]) == expected
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_unset_non_null_variable_still_fails(appsync):
+    """A non-null variable the request does not send is a coercion error, not a null."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-non-null")
+    try:
+        out = _graphql(api_id, key, "query Q($a: String!) { echo(a: $a) }", {})
+        assert out.get("data") is None
+        assert "$a" in out["errors"][0]["message"]
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_unset_variable_follows_the_selected_operation(appsync):
+    """Only the variables of the operation named by operationName are materialized."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-operation-name")
+    try:
+        document = ("query One($a: String) { echo(a: $a) }\n"
+                    "query Two($b: String) { echo(b: $b) }")
+        req = urllib.request.Request(
+            f"{_ENDPOINT}/v1/apis/{api_id}/graphql", method="POST",
+            data=json.dumps({"query": document, "operationName": "Two", "variables": {}}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            out = json.loads(r.read())
+        assert json.loads(out["data"]["echo"]) == {"b": None}
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+_UNSET_IN_INPUT_SDL = """
+input In { a: String b: String }
+type Node { echo(a: String, b: String): AWSJSON }
+type Query { echo(a: String, b: String, i: In, l: [String], li: [In]): AWSJSON node: Node }
+"""
+
+
+@pytest.mark.parametrize("query, variables, expected", [
+    ("query Q($a: String, $b: String) { echo(i: {a: $a, b: $b}) }", {"a": "x"}, {"i": {"a": "x"}}),
+    ("query Q($a: String, $b: String) { echo(i: {a: $a, b: $b}) }", {}, {"i": {}}),
+    ("query Q($a: String, $b: String) { echo(i: {a: $a, b: $b}) }", {"a": "x", "b": None}, {"i": {"a": "x", "b": None}}),
+    ('query Q($a: String, $b: String = "d") { echo(i: {a: $a, b: $b}) }', {"a": "x"}, {"i": {"a": "x", "b": "d"}}),
+    ('query Q($a: String) { echo(l: [$a, "y"]) }', {}, {"l": [None, "y"]}),
+    ("query Q($a: String, $b: String) { echo(li: [{a: $a, b: $b}]) }", {"a": "x"}, {"li": [{"a": "x"}]}),
+    ("query Q($i: In) { echo(i: $i) }", {"i": {"a": "x"}}, {"i": {"a": "x"}}),
+    ("query Q($i: In) { echo(i: $i) }", {}, {"i": None}),
+    ("query Q($a: String, $b: String) { node { echo(a: $a, b: $b) } }", {"a": "x"}, {"a": "x", "b": None}),
+], ids=["input-unset", "input-all-unset", "input-explicit-null", "input-default", "list", "list-of-inputs",
+        "whole-input-sparse", "whole-input-unset", "nested-field"])
+def test_appsync_graphql_unset_variable_inside_an_input_object_stays_absent(appsync, query, variables, expected):
+    """Only an argument bound to an unsent variable becomes null; an input object field stays absent."""
+    api_id, key = _js_api(appsync, "gql-unset-in-input")
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=_UNSET_IN_INPUT_SDL.encode())
+        code = """
+            export function request(ctx) { return { payload: ctx.arguments } }
+            export function response(ctx) { return JSON.stringify(ctx.result) }
+        """
+        _js_resolver(appsync, api_id, "echo", code)
+        _js_resolver(appsync, api_id, "node", """
+            export function request(ctx) { return { payload: {} } }
+            export function response(ctx) { return ctx.result }
+        """)
+        appsync.create_resolver(apiId=api_id, typeName="Node", fieldName="echo", dataSourceName="DS",
+                                runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"}, code=code)
+        out = _graphql(api_id, key, query, variables)
+        assert "errors" not in out, out
+        echo = out["data"]["node"]["echo"] if "node" in out["data"] else out["data"]["echo"]
+        assert json.loads(echo) == expected
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+_VALIDATION_WORDING_SDL = """
+input TaskInput { title: String }
+type Task { id: ID title: String }
+type Query { getTask(id: ID!): Task }
+type Mutation { createTask(input: TaskInput!): Task updateTask(id: ID!): Task }
+"""
+
+
+@pytest.mark.parametrize("query, variables, error", [
+    ('mutation { updateTask(id: "x", nope: "y") { id } }', None,
+     {"message": "Validation error of type UnknownArgument: Unknown field argument nope @ 'updateTask'",
+      "locations": [{"line": 1, "column": 32}]}),
+    ('query { getTask(id: "x") { nope } }', None,
+     {"message": "Validation error of type FieldUndefined: Field 'nope' in type 'Task' is undefined @ 'getTask/nope'",
+      "locations": [{"line": 1, "column": 28}]}),
+    ("mutation M($input: TaskInput!) { createTask(input: $input) { id } }", {"input": {"nope": 1}},
+     {"message": "The variables input contains a field that is not defined for input object type 'TaskInput' "}),
+], ids=["unknown-argument", "unknown-field", "extra-input-field"])
+def test_appsync_graphql_validation_errors_use_appsync_wording(appsync, query, variables, error):
+    """AppSync validates with graphql-java, so a refused operation carries its error text, not graphql-core's."""
+    api_id = appsync.create_graphql_api(name="gql-wording", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=_VALIDATION_WORDING_SDL.encode())
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        out = _graphql(api_id, key, query, variables)
+        assert out.get("data") is None
+        assert out["errors"] == [error]
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_other_validation_errors_keep_their_message(appsync):
+    """Only the messages with an AppSync wording are rewritten; the rest are left as they are."""
+    api_id = appsync.create_graphql_api(name="gql-wording-rest", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=_VALIDATION_WORDING_SDL.encode())
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        out = _graphql(api_id, key, "query { getTask { id } }")
+        assert out["errors"][0]["message"] == (
+            "Field 'getTask' argument 'id' of type 'ID!' is required, but it was not provided.")
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)

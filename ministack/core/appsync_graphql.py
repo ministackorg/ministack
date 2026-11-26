@@ -18,7 +18,9 @@ schema change invalidates it and nothing else pays for the parse.
 
 from __future__ import annotations
 
+import copy
 import logging
+import re
 
 from graphql import (
     GraphQLError,
@@ -29,6 +31,8 @@ from graphql import (
     validate,
 )
 from graphql.execution import ExecutionResult
+from graphql.language import FieldNode, InlineFragmentNode, VariableNode
+from graphql.validation import MaxIntrospectionDepthRule, specified_rules
 
 logger = logging.getLogger("appsync")
 
@@ -89,15 +93,61 @@ def forget_schema(api_id: str | None = None):
         _schema_cache.pop(api_id, None)
 
 
-def _as_appsync_errors(errors):
+# graphql-core's wording for these failures, rewritten to AppSync's (graphql-java); the bool keeps locations.
+_APPSYNC_WORDING = [
+    (re.compile(r"^Unknown argument '(\w+)' on field '\w+\.\w+'\.$"),
+     "Validation error of type UnknownArgument: Unknown field argument {0} @ '{path}'", True),
+    (re.compile(r"^Cannot query field '(\w+)' on type '(\w+)'\..*$", re.S),
+     "Validation error of type FieldUndefined: Field '{0}' in type '{1}' is undefined @ '{path}'", True),
+    (re.compile(r"^Variable '\$\w+' got invalid value .*; Field '\w+' is not defined by type '(\w+)'\.$", re.S),
+     "The variables input contains a field that is not defined for input object type '{0}' ", False),
+]
+
+
+def _field_path(document, target):
+    """The names of the fields from the operation root down to the field `target` is or is an argument of."""
+    def walk(selection_set, prefix):
+        for selection in selection_set.selections if selection_set else ():
+            if isinstance(selection, FieldNode):
+                path = prefix + [selection.name.value]
+                if selection is target or any(arg is target for arg in selection.arguments or ()):
+                    return path
+                found = walk(selection.selection_set, path)
+            elif isinstance(selection, InlineFragmentNode):
+                found = walk(selection.selection_set, prefix)
+            else:
+                continue
+            if found:
+                return found
+        return None
+
+    for definition in document.definitions if document else ():
+        found = walk(getattr(definition, "selection_set", None), [])
+        if found:
+            return "/".join(found)
+    return None
+
+
+def _appsync_wording(err, document):
+    """AppSync's message for `err` and whether it keeps its locations, or None when AppSync's wording is not known."""
+    for pattern, template, locations in _APPSYNC_WORDING:
+        match = pattern.match(err.message)
+        if match:
+            path = _field_path(document, err.nodes[0]) if err.nodes else None
+            return template.format(*match.groups(), path=path or match.group(1)), locations
+    return None
+
+
+def _as_appsync_errors(errors, document=None):
     """Render graphql-core errors the way AppSync renders them."""
     out = []
     for err in errors or []:
         original = getattr(err, "original_error", None)
-        entry = {"message": err.message}
+        message, locations = _appsync_wording(err, document) or (err.message, True)
+        entry = {"message": message}
         if err.path:
             entry["path"] = list(err.path)
-        if err.locations:
+        if err.locations and locations:
             entry["locations"] = [
                 {"line": loc.line, "column": loc.column} for loc in err.locations
             ]
@@ -113,7 +163,46 @@ def _as_appsync_errors(errors):
     return out
 
 
-def execute(api_id, sdl, query, variables, operation_name, field_resolver, context):
+def _unset_arguments_as_null(resolver, variables):
+    """AppSync gives an argument bound to an unsent variable as null; inside an input object it stays absent."""
+    def resolve(source, info, **args):
+        for arg in info.field_nodes[0].arguments:
+            if (isinstance(arg.value, VariableNode) and arg.value.name.value not in variables
+                    and arg.name.value not in args):
+                args[arg.name.value] = None
+        return resolver(source, info, **args)
+    return resolve
+
+
+# AppSync has no introspection-depth rule, only queryDepthLimit.
+_VALIDATION_RULES = [rule for rule in specified_rules if rule is not MaxIntrospectionDepthRule]
+
+# What AppSync appends once when it cuts a selection at queryDepthLimit.
+_DEPTH_LIMIT_ERROR = {
+    "path": [],
+    "data": None,
+    "errorType": "QueryDepthLimitReached",
+    "errorInfo": None,
+    "locations": [],
+    "message": "Query depth limit reached.",
+}
+
+
+class _DepthLimit:
+    """Middleware: a field more than `limit` field names deep resolves to null and flags the error."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.reached = False
+
+    def resolve(self, next_, root, info, **args):
+        if sum(isinstance(key, str) for key in info.path.as_list()) > self.limit:
+            self.reached = True
+            return None
+        return next_(root, info, **args)
+
+
+def execute(api_id, sdl, query, variables, operation_name, field_resolver, context, query_depth_limit=0):
     """Parse, validate and execute one operation.
 
     `field_resolver(source, info, **args)` is called for every field, and is
@@ -129,16 +218,21 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
 
     # Validation is the step the regex could never do: an unknown field or a
     # mistyped variable is refused here instead of resolving to null.
-    errors = validate(schema, document)
+    errors = validate(schema, document, _VALIDATION_RULES)
     if errors:
-        return None, _as_appsync_errors(errors)
+        return None, _as_appsync_errors(errors, document)
 
+    depth_limit = _DepthLimit(query_depth_limit) if query_depth_limit else None
     result: ExecutionResult = execute_sync(
         schema,
         document,
         variable_values=variables or {},
         operation_name=operation_name,
         context_value=context,
-        field_resolver=field_resolver,
+        field_resolver=_unset_arguments_as_null(field_resolver, variables or {}),
+        middleware=[depth_limit] if depth_limit else None,
     )
-    return result.data, _as_appsync_errors(result.errors)
+    errors = _as_appsync_errors(result.errors)
+    if depth_limit and depth_limit.reached:
+        errors.insert(0, copy.deepcopy(_DEPTH_LIMIT_ERROR))
+    return result.data, errors
