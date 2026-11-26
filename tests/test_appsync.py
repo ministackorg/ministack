@@ -2826,6 +2826,18 @@ def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
         appsync.delete_graphql_api(apiId=api_id)
 
 
+_UNSET_VARIABLES_SDL = """
+type Query { echo(a: String, b: String): AWSJSON }
+"""
+
+
+def _echo_arguments_api(appsync, name):
+    """An API whose Query.echo returns the arguments its resolver received, as JSON."""
+    api_id, key = _js_api(appsync, name)
+    appsync.start_schema_creation(apiId=api_id, definition=_UNSET_VARIABLES_SDL.encode())
+    _js_resolver(appsync, api_id, "echo", """
+        export function request(ctx) { return { payload: ctx.arguments } }
+        export function response(ctx) { return JSON.stringify(ctx.result) }
 _DEPTH_SDL = """
 type Node { id: ID child: Node }
 type Query { node: Node }
@@ -2855,6 +2867,26 @@ def _depth_api(appsync, limit):
     return api_id, key
 
 
+@pytest.mark.parametrize("variables, query, expected", [
+    # A declared variable the request does not send reaches the resolver as null.
+    ({"a": "x"}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": "x", "b": None}),
+    ({}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": None, "b": None}),
+    # An argument the document does not pass at all stays absent.
+    ({"a": "x"}, "query Q($a: String) { echo(a: $a) }", {"a": "x"}),
+    ({}, "query Q { echo(a: \"x\") }", {"a": "x"}),
+    # A default value is kept.
+    ({}, 'query Q($a: String, $b: String = "d") { echo(a: $a, b: $b) }', {"a": None, "b": "d"}),
+    # An explicit null stays null.
+    ({"a": "x", "b": None}, "query Q($a: String, $b: String) { echo(a: $a, b: $b) }", {"a": "x", "b": None}),
+], ids=["one-unset", "all-unset", "arg-not-passed", "no-variables", "default-kept", "explicit-null"])
+def test_appsync_graphql_declared_unset_variable_is_null_in_arguments(appsync, variables, query, expected):
+    """AppSync passes every variable the operation declares, the request does not send and that has no
+    default to the resolver as null; an argument is absent only when the document does not pass it."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-variables")
+    try:
+        out = _graphql(api_id, key, query, variables)
+        assert "errors" not in out, out
+        assert json.loads(out["data"]["echo"]) == expected
 def _graphql_operation(api_id, key, query, operation_name=None):
     body = {"query": query, **({"operationName": operation_name} if operation_name else {})}
     req = urllib.request.Request(
@@ -2935,6 +2967,13 @@ def test_appsync_graphql_nested_introspection_within_the_limit_is_answered(appsy
         appsync.delete_graphql_api(apiId=api_id)
 
 
+def test_appsync_graphql_unset_non_null_variable_still_fails(appsync):
+    """A non-null variable the request does not send is a coercion error, not a null."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-non-null")
+    try:
+        out = _graphql(api_id, key, "query Q($a: String!) { echo(a: $a) }", {})
+        assert out.get("data") is None
+        assert "$a" in out["errors"][0]["message"]
 @pytest.mark.parametrize("limit", [14, 15], ids=["limit-14", "limit-15"])
 def test_appsync_graphql_standard_introspection_query_is_answered(appsync, limit):
     from graphql import get_introspection_query
@@ -2949,6 +2988,19 @@ def test_appsync_graphql_standard_introspection_query_is_answered(appsync, limit
         appsync.delete_graphql_api(apiId=api_id)
 
 
+def test_appsync_graphql_unset_variable_follows_the_selected_operation(appsync):
+    """Only the variables of the operation named by operationName are materialized."""
+    api_id, key = _echo_arguments_api(appsync, "gql-unset-operation-name")
+    try:
+        document = ("query One($a: String) { echo(a: $a) }\n"
+                    "query Two($b: String) { echo(b: $b) }")
+        req = urllib.request.Request(
+            f"{_ENDPOINT}/v1/apis/{api_id}/graphql", method="POST",
+            data=json.dumps({"query": document, "operationName": "Two", "variables": {}}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            out = json.loads(r.read())
+        assert json.loads(out["data"]["echo"]) == {"b": None}
 def test_appsync_graphql_standard_introspection_query_is_cut_by_a_low_limit(appsync):
     from graphql import get_introspection_query
 
