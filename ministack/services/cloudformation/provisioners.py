@@ -7183,7 +7183,7 @@ def _sm_secret_create(logical_id, props, stack_name):
         "Tags": props.get("Tags", []),
         "CreatedDate": int(_time.time()), "LastChangedDate": int(_time.time()),
         "LastAccessedDate": None, "DeletedDate": None,
-        "RotationEnabled": False, "RotationLambdaARN": None,
+        "RotationEnabled": None, "RotationLambdaARN": None,
         "RotationRules": None, "ReplicationStatus": [],
         "KmsKeyId": props.get("KmsKeyId"),
         "Versions": {
@@ -12950,6 +12950,42 @@ def _sm_target_attachment_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# SecretsManager RotationSchedule
+# ---------------------------------------------------------------------------
+
+def _sm_rotation_schedule_rotate(props, immediately):
+    if props.get("HostedRotationLambda"):
+        raise ValueError("AWS::SecretsManager::RotationSchedule: HostedRotationLambda is not supported")
+    data = {"SecretId": props.get("SecretId"), "RotateImmediately": immediately}
+    if props.get("RotationLambdaARN"):
+        data["RotationLambdaARN"] = props["RotationLambdaARN"]
+    rules = props.get("RotationRules")
+    if rules:
+        data["RotationRules"] = {k: int(v) if k == "AutomaticallyAfterDays" else v for k, v in rules.items()}
+    status, _headers, body = _sm._rotate_secret(data)
+    if status >= 400:
+        err = json.loads(body)
+        raise ValueError(err.get("message") or err.get("Message") or body)
+    return json.loads(body)["ARN"]
+
+
+def _sm_rotation_schedule_create(logical_id, props, stack_name):
+    return _sm_rotation_schedule_rotate(props, True), {}
+
+
+def _sm_rotation_schedule_update(physical_id, old_props, new_props, stack_name):
+    if old_props.get("SecretId") != new_props.get("SecretId"):
+        # A replacement: the schedule moves to the new secret, and the cleanup cancels the old one.
+        return _sm_rotation_schedule_rotate(new_props, True), {}
+    immediately = str(new_props.get("RotateImmediatelyOnUpdate", True)).lower() != "false"
+    return _sm_rotation_schedule_rotate(new_props, immediately), {}
+
+
+def _sm_rotation_schedule_delete(physical_id, props):
+    _sm._cancel_rotate_secret({"SecretId": physical_id})
+
+
+# ---------------------------------------------------------------------------
 # AutoScaling Group
 # ---------------------------------------------------------------------------
 
@@ -15584,6 +15620,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::RDS::DBParameterGroup": ("DBParameterGroupName", "Description", "Family"),
     "AWS::RDS::DBClusterParameterGroup": ("DBClusterParameterGroupName", "Description", "Family"),
     "AWS::SecretsManager::SecretTargetAttachment": ("SecretId",),
+    "AWS::SecretsManager::RotationSchedule": ("SecretId",),
     "AWS::ElastiCache::CacheCluster": (
         "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName", "ClusterName",
         "Engine", "NetworkType",
@@ -16522,6 +16559,11 @@ _RESOURCE_HANDLERS = {
         "update": _docdb_cluster_param_group_update,
         "update_with_logical_id": True,
         "delete": _rds_cluster_param_group_delete,
+    },
+    "AWS::SecretsManager::RotationSchedule": {
+        "create": _sm_rotation_schedule_create,
+        "update": _sm_rotation_schedule_update,
+        "delete": _sm_rotation_schedule_delete,
     },
     "AWS::SecretsManager::SecretTargetAttachment": {
         "create": _sm_target_attachment_create,

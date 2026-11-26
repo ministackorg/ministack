@@ -1495,7 +1495,7 @@ def test_secret_label_updated_event_to_eventbridge(sm, eb, sqs):
     eb.put_rule(
         Name=f"sm-rule-{suffix}",
         EventPattern=json.dumps({"source": ["aws.secretsmanager"],
-                                 "detail-type": ["Secret Label Updated"]}),
+                                 "detail-type": ["Secret Label Updated"], "detail": {"name": [name]}}),
     )
     eb.put_targets(Rule=f"sm-rule-{suffix}", Targets=[{"Id": "1", "Arn": qarn}])
 
@@ -1655,6 +1655,171 @@ def test_secretsmanager_rotate_secret_runs_the_rotation_function(sm, lam):
         assert json.loads(current["SecretString"]) == ["ClientRequestToken", "RotationToken", "SecretId", "Step"]
         stages = {v["VersionId"]: v["VersionStages"] for v in sm.list_secret_version_ids(SecretId=name)["Versions"]}
         assert sorted(stages[new]) == ["AWSCURRENT", "AWSPENDING"] and stages[old] == ["AWSPREVIOUS"]
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+        lam.delete_function(FunctionName=fn)
+
+
+def _rotator_function(lam):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _ROTATOR)
+    fn = f"rotator-{_uuid_mod.uuid4().hex[:8]}"
+    arn = lam.create_function(FunctionName=fn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/r",
+                              Handler="index.handler", Code={"ZipFile": buf.getvalue()}, Timeout=15)["FunctionArn"]
+    return fn, arn
+
+
+def _window_end(start, hours=None):
+    import datetime as dt
+
+    end = start + dt.timedelta(hours=hours) if hours else start.replace(hour=0) + dt.timedelta(days=1)
+    return end - dt.timedelta(seconds=1)
+
+
+def test_secretsmanager_rotation_schedule_and_cancel(sm, lam):
+    """NextRotationDate, the derived AutomaticallyAfterDays, the RotationRules refusals and CancelRotateSecret
+    (AWS capture 2026-11-26, eu-north-1)."""
+    import datetime as dt
+
+    fn, arn = _rotator_function(lam)
+    name = f"rot-sched-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=name, SecretString="initial")
+    lax = boto3.client("secretsmanager", endpoint_url=sm.meta.endpoint_url, region_name=sm.meta.region_name,
+                       aws_access_key_id="test", aws_secret_access_key="test",
+                       config=Config(parameter_validation=False))
+    try:
+        assert "RotationEnabled" not in sm.describe_secret(SecretId=name)
+        with pytest.raises(ClientError) as e:
+            sm.rotate_secret(SecretId=name, RotateImmediately=False)
+        assert (e.value.response["Error"]["Code"], e.value.response["Error"]["Message"]) == (
+            "InvalidRequestException", "No Lambda rotation function ARN is associated with this secret.")
+
+        for rules, code, message in (
+                ({"ScheduleExpression": "rate(3 hours)"}, "InvalidParameterException",
+                 "Rate in hour should be least 4 and less than 24."),
+                ({"ScheduleExpression": "rate(10 days)", "AutomaticallyAfterDays": 10}, "InvalidParameterException",
+                 "You cannot specify both rotation frequency and schedule expression together."),
+                ({"AutomaticallyAfterDays": 1001}, "ValidationException",
+                 "1 validation error detected: Value '1001' at 'rotationRules.automaticallyAfterDays' failed to "
+                 "satisfy constraint: Member must have value less than or equal to 1000"),
+                ({"AutomaticallyAfterDays": 0}, "ValidationException",
+                 "1 validation error detected: Value '0' at 'rotationRules.automaticallyAfterDays' failed to "
+                 "satisfy constraint: Member must have value greater than or equal to 1"),
+                ({"AutomaticallyAfterDays": 7, "Duration": "25h"}, "InvalidParameterException",
+                 "Duration must be at least 1 hour, at most 24 hour."),
+                ({"Duration": "3h"}, "InvalidParameterException",
+                 "You must provide a schedule expression or rotation frequency when using the duration option."),
+                ({"ScheduleExpression": "every day"}, "InvalidParameterException", "Invalid schedule expression."),
+                ({"ScheduleExpression": "rate(24 hours)"}, "InvalidParameterException",
+                 "Rate in hour should be least 4 and less than 24."),
+                ({"ScheduleExpression": "rate(0 days)"}, "InvalidParameterException",
+                 "Rate in day should be greater than 0 and less than 1000."),
+                ({"ScheduleExpression": "cron(30 8 * * ? *)"}, "InvalidParameterException",
+                 "Invalid schedule expression."),
+                ({"ScheduleExpression": "cron(0 8 * * ? 2027)"}, "InvalidParameterException",
+                 "Invalid schedule expression."),
+                ({"AutomaticallyAfterDays": 7, "Duration": "2"}, "ValidationException",
+                 "2 validation errors detected: Value '2' at 'rotationRules.duration' failed to satisfy constraint: "
+                 "Member must satisfy regular expression pattern: [0-9]+h; Value '2' at 'rotationRules.duration' "
+                 "failed to satisfy constraint: Member must have length greater than or equal to 2"),
+                ({"AutomaticallyAfterDays": 7, "Duration": "0h"}, "InvalidParameterException",
+                 "Duration must be at least 1 hour, at most 24 hour."),
+                ({"ScheduleExpression": "rate(4 hours)", "Duration": "5h"}, "InvalidParameterException",
+                 "Duration cannot be greater than Rate in hour."),
+                ({"ScheduleExpression": "cron(0 20 * * ? *)", "Duration": "6h"}, "InvalidParameterException",
+                 "Starting hour and duration must be within a day.")):
+            with pytest.raises(ClientError) as e:
+                lax.rotate_secret(SecretId=name, RotationLambdaARN=arn, RotationRules=rules, RotateImmediately=False)
+            assert (e.value.response["Error"]["Code"], e.value.response["Error"]["Message"]) == (code, message), rules
+        assert "RotationEnabled" not in sm.describe_secret(SecretId=name)
+
+        now = dt.datetime.now(dt.timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        hour = now.replace(minute=0, second=0, microsecond=0)
+        for rules, days, end in (
+                ({"AutomaticallyAfterDays": 7}, 7, _window_end(midnight + dt.timedelta(days=7))),
+                ({"AutomaticallyAfterDays": 7, "Duration": "2h"}, 7, _window_end(midnight + dt.timedelta(days=7), 2)),
+                ({"ScheduleExpression": "rate(4 hours)"}, 1, _window_end(hour + dt.timedelta(hours=4), 1)),
+                ({"ScheduleExpression": "rate(4 hours)", "Duration": "1h"}, 1,
+                 _window_end(hour + dt.timedelta(hours=4), 1)),
+                ({"ScheduleExpression": "rate(2 days)"}, 2, _window_end(midnight + dt.timedelta(days=2))),
+                ({"ScheduleExpression": "rate(5 hours)", "Duration": "2h"}, 1,
+                 _window_end(hour + dt.timedelta(hours=5), 2)),
+                ({"ScheduleExpression": "rate(1000 days)"}, 1000, _window_end(midnight + dt.timedelta(days=1000))),
+                ({"ScheduleExpression": "cron(0 8 ? * MON *)"}, None, None)):
+            version = sm.rotate_secret(SecretId=name, RotationLambdaARN=arn, RotationRules=rules,
+                                       RotateImmediately=False)["VersionId"]
+            try:
+                # Until testSecret finishes, the AWSPENDING version it tests holds the current value.
+                assert sm.get_secret_value(SecretId=name, VersionStage="AWSPENDING")["SecretString"] == "initial"
+            except ClientError:
+                pass
+            d = sm.describe_secret(SecretId=name)
+            if days is None:
+                start = hour + dt.timedelta(hours=1)
+                while (start.weekday(), start.hour) != (0, 8):
+                    start += dt.timedelta(hours=1)
+                days, end = max(1, (start.date() - now.date()).days), _window_end(start)
+            assert d["RotationEnabled"] is True and d["RotationRules"] == {"AutomaticallyAfterDays": days, **rules}
+            assert d["NextRotationDate"] == end, rules
+            assert "LastRotatedDate" not in d
+        # The test version testSecret ran against is gone once the test ends.
+        for _ in range(40):
+            if version not in sm.describe_secret(SecretId=name)["VersionIdsToStages"]:
+                break
+            time.sleep(0.5)
+        assert list(sm.describe_secret(SecretId=name)["VersionIdsToStages"].values()) == [["AWSCURRENT"]]
+
+        scheduled = sm.describe_secret(SecretId=name)["NextRotationDate"]
+        sm.rotate_secret(SecretId=name, RotationLambdaARN=arn, RotationRules={}, RotateImmediately=False)
+        d = sm.describe_secret(SecretId=name)
+        assert "RotationRules" not in d and d["NextRotationDate"] == scheduled
+
+        cancelled = sm.cancel_rotate_secret(SecretId=name)
+        assert {k for k in cancelled if k != "ResponseMetadata"} == {"ARN", "Name"}
+        d = sm.describe_secret(SecretId=name)
+        assert d["RotationEnabled"] is False and "NextRotationDate" not in d and d["RotationLambdaARN"] == arn
+        sm.cancel_rotate_secret(SecretId=name)
+        sm.rotate_secret(SecretId=name, RotateImmediately=False)
+        d = sm.describe_secret(SecretId=name)
+        assert d["RotationEnabled"] is True and d["NextRotationDate"] == scheduled
+        with pytest.raises(ClientError) as e:
+            sm.cancel_rotate_secret(SecretId=f"{name}-missing")
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        new = sm.rotate_secret(SecretId=name, RotationRules={"ScheduleExpression": "rate(4 hours)"})["VersionId"]
+        for _ in range(60):
+            d = sm.describe_secret(SecretId=name)
+            if "LastRotatedDate" in d:
+                break
+            time.sleep(0.5)
+        assert "AWSCURRENT" in d["VersionIdsToStages"][new]
+        rotated = d["LastRotatedDate"].replace(minute=0, second=0, microsecond=0)
+        assert d["NextRotationDate"] == _window_end(rotated + dt.timedelta(hours=4), 1)
+        assert d["RotationRules"] == {"AutomaticallyAfterDays": 1, "ScheduleExpression": "rate(4 hours)"}
+
+        # A value set by hand counts as a rotation; the version it replaces loses AWSPENDING too.
+        time.sleep(1.1)
+        manual = sm.put_secret_value(SecretId=name, SecretString="manual")["VersionId"]
+        after = sm.describe_secret(SecretId=name)
+        assert after["LastRotatedDate"] > d["LastRotatedDate"]
+        assert after["VersionIdsToStages"] == {manual: ["AWSCURRENT"], new: ["AWSPREVIOUS"]}
+
+        for rules, days, window in (({"ScheduleExpression": "cron(0 4/12 * * ? *)"}, 1, 1),
+                                    ({"ScheduleExpression": "cron(0 23 * * ? *)"}, None, None)):
+            sm.rotate_secret(SecretId=name, RotationRules=rules, RotateImmediately=False)
+            now = dt.datetime.now(dt.timezone.utc)
+            start = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+            while start.hour not in ((4, 16) if window else (23,)):
+                start += dt.timedelta(hours=1)
+            d = sm.describe_secret(SecretId=name)
+            expected = days if days is not None else (start.date() - now.date()).days
+            assert d["RotationRules"]["AutomaticallyAfterDays"] == expected, rules
+            assert d["NextRotationDate"] == _window_end(start, window), rules
     finally:
         sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
         lam.delete_function(FunctionName=fn)

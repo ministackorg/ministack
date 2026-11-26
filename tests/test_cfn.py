@@ -39908,3 +39908,77 @@ def test_cfn_event_properties_mask_a_no_echo_parameter_and_rollback_deletes_carr
             assert json.loads(e["ResourceProperties"]) == {"Tags": [{"Key": "pw", "Value": "****"}]}
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_secretsmanager_rotation_schedule_lifecycle(cfn, sm, lam):
+    """AWS::SecretsManager::RotationSchedule: create rotates now, an update with RotateImmediatelyOnUpdate false only
+    tests, a SecretId change replaces the schedule and cancels the old one, removal cancels it (AWS capture
+    2026-11-26, eu-north-1)."""
+    from test_secretsmanager import _rotator_function
+
+    fn, arn = _rotator_function(lam)
+    tag = f"cfn-rot-{_uuid_mod.uuid4().hex[:8]}"
+    stack = f"{tag}-stack"
+
+    def template(schedule=None):
+        res = {"One": {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": f"{tag}-one", "SecretString": "1"}},
+               "Two": {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": f"{tag}-two", "SecretString": "2"}}}
+        if schedule is None:
+            return json.dumps({"Resources": res})
+        res["Rot"] = {"Type": "AWS::SecretsManager::RotationSchedule", "Properties": schedule}
+        return json.dumps({"Resources": res, "Outputs": {"RotRef": {"Value": {"Ref": "Rot"}}}})
+
+    def rotated(secret, since=None):
+        for _ in range(60):
+            last = sm.describe_secret(SecretId=secret).get("LastRotatedDate")
+            if last and last != since:
+                return last, sm.get_secret_value(SecretId=secret)["VersionId"]
+            time.sleep(0.5)
+        raise AssertionError(f"{secret} was not rotated")
+
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template(
+            {"SecretId": {"Ref": "One"}, "RotationLambdaARN": arn, "RotationRules": {"AutomaticallyAfterDays": 30}}))
+        st = _wait_stack(cfn, stack)
+        assert st["StackStatus"] == "CREATE_COMPLETE"
+        one = sm.describe_secret(SecretId=f"{tag}-one")
+        assert st["Outputs"][0]["OutputValue"] == one["ARN"]
+        assert cfn.describe_stack_resource(StackName=stack, LogicalResourceId="Rot")[
+            "StackResourceDetail"]["PhysicalResourceId"] == one["ARN"]
+        assert one["RotationEnabled"] is True and one["RotationRules"] == {"AutomaticallyAfterDays": 30}
+        last, one0 = rotated(f"{tag}-one")
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(
+            {"SecretId": {"Ref": "One"}, "RotationLambdaARN": arn, "RotateImmediatelyOnUpdate": False,
+             "RotationRules": {"AutomaticallyAfterDays": 10}}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        time.sleep(2)
+        one = sm.describe_secret(SecretId=f"{tag}-one")
+        assert sm.get_secret_value(SecretId=f"{tag}-one")["VersionId"] == one0 and one["LastRotatedDate"] == last
+        assert one["RotationRules"] == {"AutomaticallyAfterDays": 10}
+
+        cfn.update_stack(StackName=stack, TemplateBody=template(
+            {"SecretId": {"Ref": "Two"}, "RotationLambdaARN": arn, "RotationRules": {"AutomaticallyAfterDays": 20}}))
+        st = _wait_stack(cfn, stack)
+        assert st["StackStatus"] == "UPDATE_COMPLETE"
+        two = sm.describe_secret(SecretId=f"{tag}-two")
+        assert st["Outputs"][0]["OutputValue"] == two["ARN"]
+        reasons = [e.get("ResourceStatusReason") for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Rot"]
+        assert "Requested update requires the creation of a new physical resource; hence creating one." in reasons
+        rotated(f"{tag}-two")
+        one = sm.describe_secret(SecretId=f"{tag}-one")
+        assert one["RotationEnabled"] is False and "NextRotationDate" not in one
+        assert one["RotationRules"] == {"AutomaticallyAfterDays": 10}
+
+        cfn.update_stack(StackName=stack, TemplateBody=template())
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        two = sm.describe_secret(SecretId=f"{tag}-two")
+        assert two["RotationEnabled"] is False and two["RotationRules"] == {"AutomaticallyAfterDays": 20}
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack)
+            _wait_stack(cfn, stack)
+        except ClientError:
+            pass
+        lam.delete_function(FunctionName=fn)
