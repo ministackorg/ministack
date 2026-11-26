@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 
 from graphql import (
     GraphQLError,
@@ -30,6 +31,7 @@ from graphql import (
     validate,
 )
 from graphql.execution import ExecutionResult
+from graphql.language import FieldNode, InlineFragmentNode
 from graphql.language import NonNullTypeNode, OperationDefinitionNode
 from graphql.validation import MaxIntrospectionDepthRule, specified_rules
 
@@ -92,15 +94,64 @@ def forget_schema(api_id: str | None = None):
         _schema_cache.pop(api_id, None)
 
 
-def _as_appsync_errors(errors):
+# AppSync validates with graphql-java, whose messages clients and tests match on.
+# graphql-core's wording for the same failures, rewritten to AppSync's. `{path}` is
+# the slash-joined field path graphql-java ends its messages with; the last item
+# says whether AppSync gives the error a location.
+_APPSYNC_WORDING = [
+    (re.compile(r"^Unknown argument '(\w+)' on field '\w+\.\w+'\.$"),
+     "Validation error of type UnknownArgument: Unknown field argument {0} @ '{path}'", True),
+    (re.compile(r"^Cannot query field '(\w+)' on type '(\w+)'\..*$", re.S),
+     "Validation error of type FieldUndefined: Field '{0}' in type '{1}' is undefined @ '{path}'", True),
+    (re.compile(r"^Variable '\$\w+' got invalid value .*; Field '\w+' is not defined by type '(\w+)'\.$", re.S),
+     "The variables input contains a field that is not defined for input object type '{0}' ", False),
+]
+
+
+def _field_path(document, target):
+    """The names of the fields from the operation root down to the field `target` is or is an argument of."""
+    def walk(selection_set, prefix):
+        for selection in selection_set.selections if selection_set else ():
+            if isinstance(selection, FieldNode):
+                path = prefix + [selection.name.value]
+                if selection is target or any(arg is target for arg in selection.arguments or ()):
+                    return path
+                found = walk(selection.selection_set, path)
+            elif isinstance(selection, InlineFragmentNode):
+                found = walk(selection.selection_set, prefix)
+            else:
+                continue
+            if found:
+                return found
+        return None
+
+    for definition in document.definitions if document else ():
+        found = walk(getattr(definition, "selection_set", None), [])
+        if found:
+            return "/".join(found)
+    return None
+
+
+def _appsync_wording(err, document):
+    """AppSync's message for `err` and whether it keeps its locations, or None when AppSync's wording is not known."""
+    for pattern, template, locations in _APPSYNC_WORDING:
+        match = pattern.match(err.message)
+        if match:
+            path = _field_path(document, err.nodes[0]) if err.nodes else None
+            return template.format(*match.groups(), path=path or match.group(1)), locations
+    return None
+
+
+def _as_appsync_errors(errors, document=None):
     """Render graphql-core errors the way AppSync renders them."""
     out = []
     for err in errors or []:
         original = getattr(err, "original_error", None)
-        entry = {"message": err.message}
+        message, locations = _appsync_wording(err, document) or (err.message, True)
+        entry = {"message": message}
         if err.path:
             entry["path"] = list(err.path)
-        if err.locations:
+        if err.locations and locations:
             entry["locations"] = [
                 {"line": loc.line, "column": loc.column} for loc in err.locations
             ]
@@ -196,7 +247,7 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
     # mistyped variable is refused here instead of resolving to null.
     errors = validate(schema, document, _VALIDATION_RULES)
     if errors:
-        return None, _as_appsync_errors(errors)
+        return None, _as_appsync_errors(errors, document)
 
     depth_limit = _DepthLimit(query_depth_limit) if query_depth_limit else None
     result: ExecutionResult = execute_sync(

@@ -2826,6 +2826,33 @@ def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
         appsync.delete_graphql_api(apiId=api_id)
 
 
+_VALIDATION_WORDING_SDL = """
+input TaskInput { title: String }
+type Task { id: ID title: String }
+type Query { getTask(id: ID!): Task }
+type Mutation { createTask(input: TaskInput!): Task updateTask(id: ID!): Task }
+"""
+
+
+@pytest.mark.parametrize("query, variables, error", [
+    ('mutation { updateTask(id: "x", nope: "y") { id } }', None,
+     {"message": "Validation error of type UnknownArgument: Unknown field argument nope @ 'updateTask'",
+      "locations": [{"line": 1, "column": 32}]}),
+    ('query { getTask(id: "x") { nope } }', None,
+     {"message": "Validation error of type FieldUndefined: Field 'nope' in type 'Task' is undefined @ 'getTask/nope'",
+      "locations": [{"line": 1, "column": 28}]}),
+    ("mutation M($input: TaskInput!) { createTask(input: $input) { id } }", {"input": {"nope": 1}},
+     {"message": "The variables input contains a field that is not defined for input object type 'TaskInput' "}),
+], ids=["unknown-argument", "unknown-field", "extra-input-field"])
+def test_appsync_graphql_validation_errors_use_appsync_wording(appsync, query, variables, error):
+    """AppSync validates with graphql-java, so a refused operation carries its error text, not graphql-core's."""
+    api_id = appsync.create_graphql_api(name="gql-wording", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=_VALIDATION_WORDING_SDL.encode())
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        out = _graphql(api_id, key, query, variables)
+        assert out.get("data") is None
+        assert out["errors"] == [error]
 _UNSET_VARIABLES_SDL = """
 type Query { echo(a: String, b: String): AWSJSON }
 """
@@ -2988,6 +3015,15 @@ def test_appsync_graphql_standard_introspection_query_is_answered(appsync, limit
         appsync.delete_graphql_api(apiId=api_id)
 
 
+def test_appsync_graphql_other_validation_errors_keep_their_message(appsync):
+    """Only the messages with an AppSync wording are rewritten; the rest are left as they are."""
+    api_id = appsync.create_graphql_api(name="gql-wording-rest", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=_VALIDATION_WORDING_SDL.encode())
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        out = _graphql(api_id, key, "query { getTask { id } }")
+        assert out["errors"][0]["message"] == (
+            "Field 'getTask' argument 'id' of type 'ID!' is required, but it was not provided.")
 def test_appsync_graphql_unset_variable_follows_the_selected_operation(appsync):
     """Only the variables of the operation named by operationName are materialized."""
     api_id, key = _echo_arguments_api(appsync, "gql-unset-operation-name")
