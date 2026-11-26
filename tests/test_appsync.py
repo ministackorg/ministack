@@ -2824,3 +2824,138 @@ def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
         assert json.loads(exc.value.read())["errors"][0]["errorType"] == "MalformedHttpRequestException"
     finally:
         appsync.delete_graphql_api(apiId=api_id)
+
+
+_DEPTH_SDL = """
+type Node { id: ID child: Node }
+type Query { node: Node }
+"""
+
+_DEPTH_LIMIT_REACHED = {
+    "path": [], "data": None, "errorType": "QueryDepthLimitReached", "errorInfo": None,
+    "locations": [], "message": "Query depth limit reached.",
+}
+
+
+def _depth_api(appsync, limit):
+    """An API whose Query.node returns a chain of seven nodes, n1 to n7."""
+    kwargs = {"queryDepthLimit": limit} if limit else {}
+    api_id = appsync.create_graphql_api(
+        name="gql-depth", authenticationType="API_KEY", **kwargs)["graphqlApi"]["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    appsync.start_schema_creation(apiId=api_id, definition=_DEPTH_SDL.encode())
+    appsync.create_data_source(apiId=api_id, name="DS", type="NONE")
+    _js_resolver(appsync, api_id, "node", """
+        export function request(ctx) {
+          return { payload: { id: "n1", child: { id: "n2", child: { id: "n3", child: { id: "n4", child: {
+            id: "n5", child: { id: "n6", child: { id: "n7" } } } } } } } };
+        }
+        export function response(ctx) { return ctx.result; }
+    """)
+    return api_id, key
+
+
+def _graphql_operation(api_id, key, query, operation_name=None):
+    body = {"query": query, **({"operationName": operation_name} if operation_name else {})}
+    req = urllib.request.Request(
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "x-api-key": key})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, json.loads(r.read())
+
+
+_CUT = {"errors": [_DEPTH_LIMIT_REACHED]}
+
+
+@pytest.mark.parametrize("query, operation_name, expected", [
+    ("{ node { id } }", None, {"data": {"node": {"id": "n1"}}}),
+    ("{ node { child { id } } }", None, {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("{ node { child { child { id } } } }", None,
+     {"data": {"node": {"child": {"child": {"id": None}}}}, **_CUT}),
+    ("{ node { child { child { child { id } } } } }", None,
+     {"data": {"node": {"child": {"child": {"child": None}}}}, **_CUT}),
+    # A fragment spread and an inline fragment add no level of their own.
+    ("query { node { ...F } } fragment F on Node { child { id } }", None,
+     {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("{ node { ... on Node { child { id } } } }", None, {"data": {"node": {"child": {"id": "n2"}}}}),
+    ("query { node { ...F } } fragment F on Node { child { child { id } } }", None,
+     {"data": {"node": {"child": {"child": {"id": None}}}}, **_CUT}),
+    # Only the selected operation counts.
+    ("query A { node { id } } query B { node { child { child { child { id } } } } }", "A",
+     {"data": {"node": {"id": "n1"}}}),
+    ("query A { node { id } } query B { node { child { child { child { id } } } } }", "B",
+     {"data": {"node": {"child": {"child": {"child": None}}}}, **_CUT}),
+], ids=["depth-2", "depth-3", "depth-4", "depth-5", "fragment-spread", "inline-fragment", "fragment-over-limit",
+        "operation-a", "operation-b"])
+def test_appsync_graphql_query_depth_limit_cuts_the_selection(appsync, query, operation_name, expected):
+    """Fields within queryDepthLimit resolve, the ones below it are null and one QueryDepthLimitReached
+    error is added to the answer."""
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        assert _graphql_operation(api_id, key, query, operation_name) == (200, expected)
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15, 0], ids=["limit-14", "limit-15", "no-limit"])
+def test_appsync_graphql_query_within_the_depth_limit_is_answered(appsync, limit):
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, "{ node { child { child { child { id } } } } }")
+        assert (status, out) == (200, {"data": {"node": {"child": {"child": {"child": {"id": "n4"}}}}}})
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+_NESTED_TYPE_QUERY = '{ __type(name: "Query") { fields { type { fields { type { fields { type { fields { name } } } } } } } } }'
+
+
+def test_appsync_graphql_introspection_counts_toward_the_depth_limit(appsync):
+    """AppSync has no introspection-specific depth rule: the nested __type query, nine levels deep, is
+    answered up to the API's queryDepthLimit and cut below it like any other selection."""
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        status, out = _graphql_operation(api_id, key, _NESTED_TYPE_QUERY)
+        assert status == 200
+        assert out == {"data": {"__type": {"fields": [{"type": {"fields": None}}]}}, **_CUT}
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15, 0], ids=["limit-14", "limit-15", "no-limit"])
+def test_appsync_graphql_nested_introspection_within_the_limit_is_answered(appsync, limit):
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, _NESTED_TYPE_QUERY)
+        assert status == 200
+        assert "errors" not in out, out
+        deepest = out["data"]["__type"]["fields"][0]["type"]["fields"][1]["type"]["fields"][1]["type"]["fields"]
+        assert deepest == [{"name": "id"}, {"name": "child"}]
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("limit", [14, 15], ids=["limit-14", "limit-15"])
+def test_appsync_graphql_standard_introspection_query_is_answered(appsync, limit):
+    from graphql import get_introspection_query
+
+    api_id, key = _depth_api(appsync, limit)
+    try:
+        status, out = _graphql_operation(api_id, key, get_introspection_query())
+        assert status == 200
+        assert "errors" not in out, out
+        assert out["data"]["__schema"]["queryType"]["name"] == "Query"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_standard_introspection_query_is_cut_by_a_low_limit(appsync):
+    from graphql import get_introspection_query
+
+    api_id, key = _depth_api(appsync, 3)
+    try:
+        status, out = _graphql_operation(api_id, key, get_introspection_query())
+        assert status == 200
+        assert out["errors"][0] == _DEPTH_LIMIT_REACHED
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
