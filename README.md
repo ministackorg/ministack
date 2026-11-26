@@ -903,6 +903,7 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `S3_PERSIST` | `0` | Set `1` to persist S3 objects to disk |
 | `S3_DATA_DIR` | `/tmp/ministack-data/s3` | S3 persistence directory |
+| `S3_VERIFY_PRESIGNED_SIGNATURES` | `0` | Set `1` to verify the signature of a presigned S3 URL with `AUTH` off, as `AUTH=true` does: a URL presigned over `Content-Type` or `If-None-Match` then refuses a request that changes them, and a URL signed with an access key MiniStack does not know is refused |
 | `REDIS_HOST` | `redis` | Redis host for ElastiCache fallback |
 | `REDIS_PORT` | `6379` | Redis port for ElastiCache fallback |
 | `RDS_BASE_PORT` | `15432` | Starting host port for RDS containers |

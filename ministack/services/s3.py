@@ -2788,7 +2788,10 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         # signed header, so a URL presigned with an unknown key or a wrong secret still works.
         if _omits_signed_header(headers, signed_headers):
             return _bad_signature()
-        return None
+        # S3_VERIFY_PRESIGNED_SIGNATURES=1 checks the credential and the signature too: a presign
+        # that signs Content-Type or If-None-Match is a write contract the client must honor.
+        if os.environ.get("S3_VERIFY_PRESIGNED_SIGNATURES", "").lower() not in ("1", "true"):
+            return None
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
         # S3's own error table: ExpiredToken and InvalidToken are 400, while

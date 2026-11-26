@@ -14233,3 +14233,48 @@ def test_s3_presigned_changed_signed_header_value_is_accepted_without_verificati
             "put_object", Params={"Bucket": bucket, "Key": "up.png", "ContentType": "image/png"}, ExpiresIn=300)
 
         assert _presigned_put_status(url, {"Content-Type": "text/plain"})[0] == 200
+
+
+def test_s3_presigned_signature_check_without_auth_is_opt_in(tmp_path):
+    """With S3_VERIFY_PRESIGNED_SIGNATURES=1 the signature is verified with AUTH off, so a changed value of a
+    signed header is refused, as on S3. Without it the value is not checked."""
+    results = {}
+    for verify in ("1", ""):
+        with _s3_server(tmp_path, S3_VERIFY_PRESIGNED_SIGNATURES=verify) as endpoint:
+            client = _presign_client(endpoint)
+            bucket = f"presign-optin-{uuid.uuid4().hex[:8]}"
+            client.create_bucket(Bucket=bucket)
+            url = client.generate_presigned_url(
+                "put_object", Params={"Bucket": bucket, "Key": "up.png", "ContentType": "image/png"}, ExpiresIn=300)
+            results[verify] = _presigned_put_status(url, {"Content-Type": "text/plain"})
+            if verify:
+                assert client.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
+            # The headers that were signed are accepted either way.
+            assert _presigned_put_status(url, {"Content-Type": "image/png"})[0] == 200
+
+    assert results["1"][0] == 403
+    assert "<Code>SignatureDoesNotMatch</Code>" in results["1"][1]
+    assert results[""][0] == 200
+
+
+def test_s3_presigned_signature_check_without_auth_rejects_unknown_key_and_keeps_valid_urls(tmp_path):
+    with _s3_server(tmp_path, S3_VERIFY_PRESIGNED_SIGNATURES="1") as endpoint:
+        good = _presign_client(endpoint)
+        bucket = f"presign-creds-{uuid.uuid4().hex[:8]}"
+        good.create_bucket(Bucket=bucket)
+        good.put_object(Bucket=bucket, Key="hello.txt", Body=b"hi")
+        params = {"Bucket": bucket, "Key": "hello.txt"}
+
+        with urllib.request.urlopen(good.generate_presigned_url("get_object", Params=params, ExpiresIn=300)) as r:
+            assert r.status == 200 and r.read() == b"hi"
+
+        url = _write_once_url(good, bucket)
+        assert _presigned_put_status(url, {"Content-Type": "text/plain"})[0] == 403
+        assert _presigned_put_status(url, _WRITE_ONCE_HEADERS)[0] == 200
+        assert _presigned_put_status(url, _WRITE_ONCE_HEADERS)[0] == 412
+
+        unknown = _presign_client(endpoint, "unknownkey", "unknownsecret")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(unknown.generate_presigned_url("get_object", Params=params, ExpiresIn=300))
+        assert exc.value.code == 403
+        assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
