@@ -1665,7 +1665,8 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
 
     try:
         data, errors = appsync_graphql.execute(
-            api_id, sdl, query, variables, operation_name, field_resolver, None)
+            api_id, sdl, query, variables, operation_name, field_resolver, None,
+            query_depth_limit=int(api.get("queryDepthLimit") or 0))
     except appsync_graphql.SchemaUnavailable as exc:
         return _json(200, {"data": None, "errors": [{"message": str(exc)}]})
     except appsync_graphql.QuerySyntaxError:

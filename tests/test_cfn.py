@@ -39908,3 +39908,44 @@ def test_cfn_event_properties_mask_a_no_echo_parameter_and_rollback_deletes_carr
             assert json.loads(e["ResourceProperties"]) == {"Tags": [{"Key": "pw", "Value": "****"}]}
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_nested_stacks_report_parent_and_root_ids(cfn, s3):
+    """DescribeStacks gives every nested stack ParentId (its direct parent) and RootId (the top-level
+    stack) at any depth; the top-level stack has neither."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-ancestry-{suffix}"
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def nested(url):
+        return {"AWSTemplateFormatVersion": "2010-09-09",
+                "Resources": {"Child": {"Type": "AWS::CloudFormation::Stack",
+                                        "Properties": {"TemplateURL": f"{endpoint}/{bucket}/{url}"}}}}
+
+    templates = {
+        "b.json": {"AWSTemplateFormatVersion": "2010-09-09", "Resources": {}},
+        "a.json": nested("b.json"),
+    }
+    root_name = f"cfn-ancestry-root-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        for key, body in templates.items():
+            s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(body).encode())
+        cfn.create_stack(StackName=root_name, TemplateBody=json.dumps(nested("a.json")))
+        root = _wait_stack(cfn, root_name)
+        assert root["StackStatus"] == "CREATE_COMPLETE", root.get("StackStatusReason")
+
+        def child_of(stack_id):
+            resource = cfn.describe_stack_resources(StackName=stack_id)["StackResources"][0]
+            return cfn.describe_stacks(StackName=resource["PhysicalResourceId"])["Stacks"][0]
+
+        a = child_of(root["StackId"])
+        b = child_of(a["StackId"])
+        assert "ParentId" not in root and "RootId" not in root
+        assert (a["ParentId"], a["RootId"]) == (root["StackId"], root["StackId"])
+        assert (b["ParentId"], b["RootId"]) == (a["StackId"], root["StackId"])
+    finally:
+        cfn.delete_stack(StackName=root_name)
+        for key in templates:
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
