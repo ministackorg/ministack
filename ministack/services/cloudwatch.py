@@ -21,6 +21,7 @@ import os
 import re
 import time
 import unicodedata
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
@@ -46,6 +47,8 @@ _alarms = AccountRegionScopedDict()
 _composite_alarms = AccountRegionScopedDict()
 # Composite alarm name -> names of its children that changed state since its last transition, newest first.
 _composite_triggers = AccountRegionScopedDict()
+# Metric alarm name -> the metric id its EventBridge events carry; a new one on every PutMetricAlarm.
+_event_metric_ids = AccountRegionScopedDict()
 # Alarm state-change history, per-account+region. Stored under a single key
 # "entries" so the standard list manipulation still applies to the caller's scope.
 _alarm_history = AccountRegionScopedDict()
@@ -118,6 +121,7 @@ def get_state():
         "alarms": copy.deepcopy(_alarms),
         "composite_alarms": copy.deepcopy(_composite_alarms),
         "composite_triggers": copy.deepcopy(_composite_triggers),
+        "event_metric_ids": copy.deepcopy(_event_metric_ids),
         "alarm_history": copy.deepcopy(_alarm_history),
         "dashboards": copy.deepcopy(_dashboards),
         "resource_tags": copy.deepcopy(_resource_tags),
@@ -134,6 +138,7 @@ def _restore_state(data):
         _alarms.update(data.get("alarms", {}))
         _composite_alarms.update(data.get("composite_alarms", {}))
         _composite_triggers.update(data.get("composite_triggers", {}))
+        _event_metric_ids.update(data.get("event_metric_ids", {}))
         _alarm_history.update(data.get("alarm_history", {}))
         _dashboards.update(data.get("dashboards", {}))
         _resource_tags.update(data.get("resource_tags", {}))
@@ -338,11 +343,14 @@ def _evaluate_alarm(alarm):
     new_state = "ALARM" if breaching else "OK"
     if old_state != new_state:
         reason = f"Threshold Crossed: {stat_name} {val} {op} {threshold}"
+        previous = _event_state(alarm)
         alarm["StateValue"] = new_state
         alarm["StateReason"] = reason
+        alarm.pop("StateReasonData", None)
         alarm["StateUpdatedTimestamp"] = int(time.time())
         _record_history(alarm["AlarmName"], old_state, new_state, reason)
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _alarm_state_changed(alarm, previous)
         _evaluate_parent_alarms(alarm)
 
 
@@ -494,6 +502,105 @@ def _dispatch_alarm_actions(alarm, old_state, new_state, reason):
             _sns._fanout(topic_arn, new_uuid(), message, subject)
         except Exception:
             logger.exception("alarm actions: SNS fanout failed for %s", topic_arn)
+
+
+# EventBridge service events (source aws.cloudwatch), in the shapes captured on AWS (2026-11-26).
+def _event_ts(epoch):
+    at = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{at.microsecond // 1000:03d}+0000"
+
+
+def _event_state(alarm, reason=True):
+    state = {"value": alarm["StateValue"]}
+    if reason and alarm.get("StateReason"):
+        state["reason"] = alarm["StateReason"]
+    if reason and alarm.get("StateReasonData"):
+        state["reasonData"] = alarm["StateReasonData"]
+    state["timestamp"] = _event_ts(alarm.get("StateUpdatedTimestamp") or time.time())
+    return state
+
+
+def _event_metrics(alarm):
+    if alarm.get("Metrics"):
+        metrics = []
+        for query in alarm["Metrics"]:
+            item = {"id": query.get("Id")}
+            stat = query.get("MetricStat")
+            if stat:
+                metric = stat.get("Metric") or {}
+                item["metricStat"] = {
+                    "metric": {"namespace": metric.get("Namespace"), "name": metric.get("MetricName"),
+                               "dimensions": {d["Name"]: d["Value"] for d in metric.get("Dimensions") or []}},
+                    "period": stat.get("Period"), "stat": stat.get("Stat")}
+                if stat.get("Unit"):
+                    item["metricStat"]["unit"] = stat["Unit"]
+            if query.get("Expression"):
+                item["expression"] = query["Expression"]
+            if query.get("Label"):
+                item["label"] = query["Label"]
+            item["returnData"] = query.get("ReturnData", True)
+            metrics.append(item)
+        return metrics
+    stat = {"metric": {"namespace": alarm.get("Namespace"), "name": alarm.get("MetricName"),
+                       "dimensions": {d["Name"]: d["Value"] for d in alarm.get("Dimensions") or []}},
+            "period": alarm.get("Period"), "stat": alarm.get("ExtendedStatistic") or alarm.get("Statistic")}
+    if alarm.get("Unit"):
+        stat["unit"] = alarm["Unit"]
+    metric_id = _event_metric_ids.setdefault(alarm["AlarmName"], str(uuid.uuid4()))
+    return [{"id": metric_id, "metricStat": stat, "returnData": True}]
+
+
+def _event_configuration(alarm, full=True):
+    composite = "AlarmRule" in alarm
+    config = {"alarmRule": alarm["AlarmRule"]} if composite else {}
+    if not composite and full:
+        config["evaluationPeriods"] = alarm.get("EvaluationPeriods")
+        if alarm.get("DatapointsToAlarm") is not None:
+            config["datapointsToAlarm"] = alarm["DatapointsToAlarm"]
+        if alarm.get("Threshold") is not None:
+            config["threshold"] = float(alarm["Threshold"])
+        config["comparisonOperator"] = alarm.get("ComparisonOperator")
+        if alarm.get("TreatMissingData") not in (None, "missing"):
+            config["treatMissingData"] = alarm["TreatMissingData"]
+    if not composite:
+        config["metrics"] = _event_metrics(alarm)
+    if full:
+        config["alarmName"] = alarm["AlarmName"]
+    if alarm.get("AlarmDescription"):
+        config["description"] = alarm["AlarmDescription"]
+    if full:
+        config["actionsEnabled"] = alarm.get("ActionsEnabled", True)
+        config["timestamp"] = _event_ts(alarm.get("AlarmConfigurationUpdatedTimestamp") or time.time())
+        for key, field in (("okActions", "OKActions"), ("alarmActions", "AlarmActions"),
+                           ("insufficientDataActions", "InsufficientDataActions")):
+            config[key] = list(alarm.get(field) or [])
+    return config
+
+
+def _emit_alarm_event(alarm, detail_type, detail):
+    try:
+        from ministack.services import eventbridge
+        eventbridge._put_events({"Entries": [{
+            "Source": "aws.cloudwatch", "DetailType": detail_type, "Detail": json.dumps(detail),
+            "Resources": [alarm["AlarmArn"]]}]}, allow_aws_source=True)
+    except Exception:
+        logger.warning("alarm event for %s failed", alarm.get("AlarmName"), exc_info=True)
+
+
+def _alarm_state_changed(alarm, previous):
+    _emit_alarm_event(alarm, "CloudWatch Alarm State Change", {
+        "alarmName": alarm["AlarmName"], "state": _event_state(alarm), "previousState": previous,
+        "configuration": _event_configuration(alarm, full=False)})
+
+
+def _alarm_configuration_changed(alarm, operation, previous=None):
+    # A delete reports a metric alarm's state with its reason; create, update and a composite's delete do not.
+    detail = {"alarmName": alarm["AlarmName"], "operation": operation,
+              "state": _event_state(alarm, reason=operation == "delete" and "AlarmRule" not in alarm),
+              "configuration": _event_configuration(alarm)}
+    if previous is not None:
+        detail["previousConfiguration"] = _event_configuration(previous)
+    _emit_alarm_event(alarm, "CloudWatch Alarm Configuration Change", detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,7 +1212,9 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     if alarm["DatapointsToAlarm"] is None:
         del alarm["DatapointsToAlarm"]
 
+    existing = _alarms.get(name)
     _alarms[name] = alarm
+    _event_metric_ids[name] = str(uuid.uuid4())
     # Tags apply on create only; a key sent twice keeps its last value.
     if is_new and tags:
         _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
@@ -1117,6 +1226,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "INSUFFICIENT_DATA",
             "Unchecked: Initial alarm creation",
         )
+    _alarm_configuration_changed(alarm, "create" if is_new else "update", existing)
 
     _evaluate_alarm(alarm)
 
@@ -1501,6 +1611,7 @@ def _transition_composite(alarm, new_state, reason, triggers, seen=frozenset()):
             })
     reason_data = {"triggeringAlarms": triggering}
     old_state = alarm["StateValue"]
+    previous = _event_state(alarm)
     now = int(time.time())
     alarm["StateValue"] = new_state
     alarm["StateReason"] = reason
@@ -1510,6 +1621,7 @@ def _transition_composite(alarm, new_state, reason, triggers, seen=frozenset()):
     _composite_triggers.pop(alarm["AlarmName"], None)
     _record_history(alarm["AlarmName"], old_state, new_state, reason, "CompositeAlarm", reason_data)
     _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+    _alarm_state_changed(alarm, previous)
     _evaluate_parent_alarms(alarm, seen)
 
 
@@ -1664,6 +1776,7 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
     _composite_alarms[name] = alarm
     if is_new and tags:
         _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
+    _alarm_configuration_changed(alarm, "update" if existing else "create", existing)
     new_state = _composite_rule_state(alarm)
     if not existing or new_state != alarm["StateValue"]:
         verb = "was updated and its new alarm rule evaluates to" if existing else \
@@ -1993,8 +2106,10 @@ def _delete_alarms(params, cbor_data, is_cbor, is_json=False):
             )
 
     for n in names:
-        _alarms.pop(n, None)
-        _composite_alarms.pop(n, None)
+        gone = _alarms.pop(n, None) or _composite_alarms.pop(n, None)
+        if gone:
+            _alarm_configuration_changed(gone, "delete")
+            _event_metric_ids.pop(n, None)
         _composite_triggers.pop(n, None)
         _resource_tags.pop(f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{n}", None)
 
@@ -2003,6 +2118,15 @@ def _delete_alarms(params, cbor_data, is_cbor, is_json=False):
     if is_json:
         return _json_ok({})
     return _xml(200, "DeleteAlarmsResponse", "")
+
+
+def _set_actions_enabled(alarm, enabled):
+    if alarm is None:
+        return
+    previous = dict(alarm)
+    alarm["ActionsEnabled"] = enabled
+    alarm["AlarmConfigurationUpdatedTimestamp"] = int(time.time())
+    _alarm_configuration_changed(alarm, "update", previous)
 
 
 def _enable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
@@ -2015,10 +2139,7 @@ def _enable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
             if _p(params, f"AlarmNames.member.{i}")
         ]
     for n in names:
-        if n in _alarms:
-            _alarms[n]["ActionsEnabled"] = True
-        if n in _composite_alarms:
-            _composite_alarms[n]["ActionsEnabled"] = True
+        _set_actions_enabled(_alarms.get(n) or _composite_alarms.get(n), True)
     if is_cbor:
         return _cbor_ok({})
     if is_json:
@@ -2036,10 +2157,7 @@ def _disable_alarm_actions(params, cbor_data, is_cbor, is_json=False):
             if _p(params, f"AlarmNames.member.{i}")
         ]
     for n in names:
-        if n in _alarms:
-            _alarms[n]["ActionsEnabled"] = False
-        if n in _composite_alarms:
-            _composite_alarms[n]["ActionsEnabled"] = False
+        _set_actions_enabled(_alarms.get(n) or _composite_alarms.get(n), False)
     if is_cbor:
         return _cbor_ok({})
     if is_json:
@@ -2072,13 +2190,16 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
 
     is_composite = name not in _alarms
     old_state = alarm["StateValue"]
-    alarm["StateValue"] = new_state
-    alarm["StateReason"] = reason
-    if reason_data:
-        alarm["StateReasonData"] = reason_data
-    elif is_composite:
-        alarm.pop("StateReasonData", None)
-    alarm["StateUpdatedTimestamp"] = int(time.time())
+    previous = _event_state(alarm)
+    # A metric alarm already in that state keeps its reason, reason data and timestamp.
+    if is_composite or old_state != new_state:
+        alarm["StateValue"] = new_state
+        alarm["StateReason"] = reason
+        if reason_data:
+            alarm["StateReasonData"] = reason_data
+        else:
+            alarm.pop("StateReasonData", None)
+        alarm["StateUpdatedTimestamp"] = int(time.time())
 
     if old_state != new_state:
         if is_composite:
@@ -2087,6 +2208,7 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
             _composite_triggers.pop(name, None)
         _record_history(name, old_state, new_state, reason, "CompositeAlarm" if is_composite else "MetricAlarm")
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _alarm_state_changed(alarm, previous)
         _evaluate_parent_alarms(alarm)
 
     if is_cbor:
@@ -2570,15 +2692,17 @@ def _error(code, message, status, use_json=False, use_cbor=False):
 def cloudformation_put_metric_alarm(alarm: dict) -> None:
     """Store a PutMetricAlarm-shaped alarm dict (CloudFormation create/update)."""
     name = alarm["AlarmName"]
-    is_new = name not in _alarms
+    existing = _alarms.get(name)
     _alarms[name] = alarm
-    if is_new:
+    _event_metric_ids[name] = str(uuid.uuid4())
+    if existing is None:
         _record_history(
             name,
             "INSUFFICIENT_DATA",
             "INSUFFICIENT_DATA",
             "Unchecked: Initial alarm creation",
         )
+    _alarm_configuration_changed(alarm, "create" if existing is None else "update", existing)
     _evaluate_alarm(alarm)
 
 
@@ -2599,7 +2723,10 @@ def cloudformation_delete_metric_alarm(name: str, refuse_dependents: bool = Fals
     if refuse_dependents and name in _alarms and any(
             name in _composite_children(parent) for parent in _composite_alarms.values()):
         raise ValueError(f"Cannot delete {name} as there are composite alarm(s) depending on it.")
-    _alarms.pop(name, None)
+    gone = _alarms.pop(name, None)
+    if gone:
+        _alarm_configuration_changed(gone, "delete")
+        _event_metric_ids.pop(name, None)
     _resource_tags.pop(
         f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}", None
     )
@@ -2630,6 +2757,7 @@ def reset():
     _alarms.clear()
     _composite_alarms.clear()
     _composite_triggers.clear()
+    _event_metric_ids.clear()
     _alarm_history.clear()
     _metrics.clear()
     _resource_tags.clear()

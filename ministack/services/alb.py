@@ -69,8 +69,17 @@ _ENTITY_TOO_LARGE_BODY = (
     b"<center><h1>413 Request Entity Too Large</h1></center>\r\n"
     b"</body>\r\n"
     b"</html>\r\n"
-    + b"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n" * 6
 )
+_FRIENDLY_PAGE_PADDING = b"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n" * 6
+
+
+def _entity_too_large(headers):
+    ua = headers.get("user-agent", "")
+    at = ua.find("MSIE ")
+    msie = at != -1 and at + 7 < len(ua) and "Opera" not in ua
+    padded = msie or ("Opera" not in ua and "Gecko/" not in ua and "Chrome/" in ua)
+    return (413, {"Content-Type": "text/html", "Connection": "close"},
+            _ENTITY_TOO_LARGE_BODY + (_FRIENDLY_PAGE_PADDING if padded else b""))
 
 # authenticate-oidc defaults, matching the AWS API.
 OIDC_DEFAULT_COOKIE_NAME = "AWSELBAuthSessionCookie"
@@ -2479,8 +2488,9 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
     target_type = tg.get("TargetType", "instance")
 
     if target_type == "lambda":
-        if body and len(body) > LAMBDA_TARGET_MAX_BODY_BYTES:
-            return 413, {"Content-Type": "text/html"}, _ENTITY_TOO_LARGE_BODY
+        chunked = "chunked" in headers.get("transfer-encoding", "").lower()
+        if body and (len(body) >= LAMBDA_TARGET_MAX_BODY_BYTES if chunked else len(body) > LAMBDA_TARGET_MAX_BODY_BYTES):
+            return _entity_too_large(headers)
         func_id = registered[0]["Id"]
         return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params, raw_query_string)

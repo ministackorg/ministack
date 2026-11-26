@@ -47,6 +47,11 @@ try:
 except ImportError:  # the wheel is optional at runtime: JSONata states refuse
     jsonata = None   # cleanly instead of the whole service failing to load
 
+try:
+    import brotli
+except ImportError:  # optional: without it, a br response fails with States.Http.InvalidCompressionType
+    brotli = None
+
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
@@ -6450,7 +6455,7 @@ _HTTP_TASK_STATUS_TEXT = {
     405: "Method Not Allowed", 406: "Not Acceptable", 407: "Proxy Authentication Required", 408: "Request Timeout",
     409: "Conflict", 410: "Gone", 411: "Length Required", 412: "Precondition Failed", 413: "Request Too Long",
     414: "Request-URI Too Long", 415: "Unsupported Media Type", 416: "Requested Range Not Satisfiable",
-    417: "Expectation Failed", 421: "Misdirected Request", 422: "Unprocessable Content", 423: "Locked",
+    417: "Expectation Failed", 420: "Method Failure", 421: "Misdirected Request", 422: "Unprocessable Content", 423: "Locked",
     424: "Failed Dependency", 425: "Too Early", 426: "Upgrade Required", 428: "Precondition Required",
     429: "Too Many Requests", 431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
     500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable",
@@ -6857,46 +6862,30 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
                 wbits = 16 + zlib.MAX_WBITS
             elif enc == "deflate":
                 wbits = zlib.MAX_WBITS
-            elif enc == "br":
-                try:
-                    import brotli
-                except ImportError:
-                    raise _ExecutionError(
-                        "States.Http.InvalidCompressionType",
-                        "Invalid Compression type received from the server",
-                    ) from None
-                try:
-                    body_bytes = brotli.decompress(body_bytes)
-                except Exception:
-                    raise _ExecutionError(
-                        "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
-                    ) from None
-                if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES:
-                    raise _ExecutionError(
-                        "States.DataLimitExceeded",
-                        "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
-                    )
-                wbits = None
-            else:
+            elif enc != "br" or brotli is None:
                 raise _ExecutionError(
                     "States.Http.InvalidCompressionType",
                     "Invalid Compression type received from the server",
                 )
-            if wbits is not None:
-                try:
+            try:
+                if enc == "br":
+                    body_bytes = brotli.decompress(body_bytes)
+                    over = len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES
+                else:
                     decomp = zlib.decompressobj(wbits)
                     body_bytes = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
                     if len(body_bytes) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
                         body_bytes += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(body_bytes))
-                    if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
-                        raise _ExecutionError(
-                            "States.DataLimitExceeded",
-                            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
-                        )
-                except zlib.error:
-                    raise _ExecutionError(
-                        "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
-                    ) from None
+                    over = len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or bool(decomp.unconsumed_tail)
+            except Exception:
+                raise _ExecutionError(
+                    "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
+                ) from None
+            if over:
+                raise _ExecutionError(
+                    "States.DataLimitExceeded",
+                    "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                )
         try:
             decoded = body_bytes.decode(explicit_charset or "utf-8", errors="strict")
         except UnicodeDecodeError:

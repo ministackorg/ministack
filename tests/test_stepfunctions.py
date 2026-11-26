@@ -1,7 +1,7 @@
 import base64
+import datetime
 import hashlib
 import io
-import datetime
 import json
 import os
 import re
@@ -11503,6 +11503,7 @@ def test_sfn_http_task_failed_calls(sfn, eb):
         assert call(f"{url}/status/422") == {"Error": "States.Http.StatusCode.422", "Cause": "Unprocessable Content"}
         assert call(f"{url}/status/301") == {"Error": "States.Http.StatusCode.301", "Cause": "Moved Permanently"}
         assert call(f"{url}/status/418") == {"Error": "States.Http.StatusCode.418", "Cause": None}
+        assert call(f"{url}/status/420") == {"Error": "States.Http.StatusCode.420", "Cause": "Method Failure"}
         assert call(f"https://sfn-http-{_uuid_mod.uuid4().hex[:8]}.invalid/echo")["Error"] == "States.Http.IpError"
         assert call(f"{url}/echo", arn=conn.replace(name, "sfn-http-none")) == {
             "Error": "Events.ConnectionResource.ResourceNotFound", "Cause": "Connection resource not found."}
@@ -12205,8 +12206,9 @@ def test_sfn_http_task_empty_charset_and_binary_responses(sfn, sfn_sync, eb):
                 "Authentication": {"ConnectionArn": conn},
             })
             assert exec_empty["ResponseBody"] == ""
+            bad_path = rpath(200, 'text/plain', b'hi\xff')
             exec_bad = _run_http_task(sfn, {
-                "ApiEndpoint": f"{url}/{rpath(200, 'text/plain', b'hi\xff')}", "Method": "GET",
+                "ApiEndpoint": f"{url}/{bad_path}", "Method": "GET",
                 "Authentication": {"ConnectionArn": conn},
             })
             assert (exec_bad["error"], exec_bad["cause"]) == ("States.Runtime", invalid_utf8_cause)
@@ -12456,6 +12458,10 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
                 body = c.compress(b'{"raw":true}') + c.flush()
                 ct = "application/json"
                 headers["Content-Encoding"] = "deflate"
+            elif path in ("/br-hello", "/br-garbage"):
+                body = bytes.fromhex("0b028068656c6c6f03") if path == "/br-hello" else b"this is not brotli"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "br"
             elif path == "/ce-double-gzip":
                 body = gzip.compress(gzip.compress(b'{"double":true}'))
                 ct = "application/json"
@@ -12551,6 +12557,18 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
             for bad_ce in ("/ce-upper-gzip", "/ce-identity", "/ce-double-gzip"):
                 r_inv = ts(bad_ce)
                 assert (r_inv["status"], r_inv["error"]) == ("FAILED", "States.Http.InvalidCompressionType")
+
+            # Real AWS decodes br (capture 2026-11-26); MiniStack does when the optional brotli package is installed.
+            try:
+                import brotli  # noqa: F401
+                r_br = ts("/br-hello")
+                assert json.loads(r_br["output"])["ResponseBody"] == "hello"
+                r_br_bad = ts("/br-garbage")
+                assert (r_br_bad["status"], r_br_bad["error"], r_br_bad["cause"]) == (
+                    "FAILED", "States.Http.FailedToParseResponse", "Failed to parse HTTP response")
+            except ImportError:
+                r_br = ts("/br-hello")
+                assert (r_br["status"], r_br["error"]) == ("FAILED", "States.Http.InvalidCompressionType")
 
             for corrupt_ce in ("/ce-corrupt-gzip", "/ce-raw-deflate"):
                 r_parse = ts(corrupt_ce)

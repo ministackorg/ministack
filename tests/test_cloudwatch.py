@@ -2380,3 +2380,201 @@ def test_cloudwatch_put_composite_alarm_refuses_invalid_tags(cw):
     finally:
         cw.delete_alarms(AlarmNames=[existing])
         cw.delete_alarms(AlarmNames=[base])
+
+
+def test_cloudwatch_alarm_events_reach_eventbridge(cw, eb, sqs):
+    """Alarm create, update and delete send CloudWatch Alarm Configuration Change, and every real state transition
+    (not an unchanged SetAlarmState) sends CloudWatch Alarm State Change, from aws.cloudwatch (AWS capture
+    2026-11-26, eu-north-1)."""
+    tag = f"cw-ev-{_uuid_mod.uuid4().hex[:8]}"
+    q = sqs.create_queue(QueueName=tag)["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name=tag, EventPattern=json.dumps({
+        "source": ["aws.cloudwatch"], "resources": [{"prefix": f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{tag}"}]}))
+    eb.put_targets(Rule=tag, Targets=[{"Id": "q", "Arn": qarn}])
+
+    def events():
+        got = []
+        for _ in range(5):
+            msgs = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+            if not msgs and got:
+                break
+            for m in msgs:
+                got.append(json.loads(m["Body"]))
+                sqs.delete_message(QueueUrl=q, ReceiptHandle=m["ReceiptHandle"])
+        return got
+
+    name, comp = f"{tag}-set", f"{tag}-composite"
+    alarm = dict(AlarmName=name, Namespace=f"MS/{tag}", MetricName="Value", Statistic="Sum", Period=60,
+                 EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanOrEqualToThreshold",
+                 TreatMissingData="notBreaching", AlarmDescription="probe alarm")
+    try:
+        cw.put_metric_alarm(**alarm)
+        [created] = events()
+        assert {k: created[k] for k in ("version", "detail-type", "source", "account", "region", "resources")} == {
+            "version": "0", "detail-type": "CloudWatch Alarm Configuration Change", "source": "aws.cloudwatch",
+            "account": "000000000000", "region": "us-east-1",
+            "resources": [f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{name}"]}
+        detail = created["detail"]
+        assert (detail["alarmName"], detail["operation"], list(detail["state"])) == (name, "create", ["value", "timestamp"])
+        assert detail["state"]["value"] == "INSUFFICIENT_DATA"
+        config = detail["configuration"]
+        assert list(config) == ["evaluationPeriods", "threshold", "comparisonOperator", "treatMissingData", "metrics",
+                                "alarmName", "description", "actionsEnabled", "timestamp", "okActions",
+                                "alarmActions", "insufficientDataActions"]
+        assert config["threshold"] == 1.0 and config["actionsEnabled"] is True and config["alarmActions"] == []
+        [metric] = config["metrics"]
+        assert {k: metric[k] for k in ("metricStat", "returnData")} == {"metricStat": {
+            "metric": {"namespace": f"MS/{tag}", "name": "Value", "dimensions": {}}, "period": 60, "stat": "Sum"},
+            "returnData": True}
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}\+0000", config["timestamp"])
+
+        cw.set_alarm_state(AlarmName=name, StateValue="ALARM", StateReason="probe to ALARM",
+                           StateReasonData=json.dumps({"probe": 1}))
+        [changed] = events()
+        assert changed["detail-type"] == "CloudWatch Alarm State Change"
+        detail = changed["detail"]
+        assert {k: v for k, v in detail["state"].items() if k != "timestamp"} == {
+            "value": "ALARM", "reason": "probe to ALARM", "reasonData": '{"probe": 1}'}
+        assert {k: v for k, v in detail["previousState"].items() if k != "timestamp"} == {
+            "value": "INSUFFICIENT_DATA", "reason": "Unchecked: Initial alarm creation"}
+        assert detail["configuration"] == {"metrics": [metric], "description": "probe alarm"}
+
+        cw.set_alarm_state(AlarmName=name, StateValue="ALARM", StateReason="probe ALARM again")
+        assert events() == []
+
+        cw.put_metric_alarm(**{**alarm, "Threshold": 2, "AlarmDescription": "probe alarm, updated"})
+        [updated] = events()
+        detail = updated["detail"]
+        assert (detail["operation"], list(detail["state"])) == ("update", ["value", "timestamp"])
+        assert (detail["configuration"]["threshold"], detail["previousConfiguration"]["threshold"]) == (2.0, 1.0)
+        assert detail["previousConfiguration"]["description"] == "probe alarm"
+
+        cw.put_composite_alarm(AlarmName=comp, AlarmRule=f'ALARM("{name}")')
+        created, transitioned = events()
+        assert (created["detail-type"], created["detail"]["operation"]) == ("CloudWatch Alarm Configuration Change", "create")
+        assert list(created["detail"]["configuration"]) == [
+            "alarmRule", "alarmName", "actionsEnabled", "timestamp", "okActions", "alarmActions",
+            "insufficientDataActions"]
+        detail = transitioned["detail"]
+        assert (detail["state"]["value"], detail["previousState"]["value"]) == ("ALARM", "INSUFFICIENT_DATA")
+        assert detail["state"]["reason"] == (
+            f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{comp} was created and its alarm rule evaluates to ALARM")
+        assert json.loads(detail["state"]["reasonData"])["triggeringAlarms"][0]["state"]["value"] == "ALARM"
+        assert detail["configuration"] == {"alarmRule": f'ALARM("{name}")'}
+
+        cw.delete_alarms(AlarmNames=[comp])
+        cw.delete_alarms(AlarmNames=[name])
+        deleted = {e["detail"]["alarmName"]: e["detail"] for e in events()}
+        assert {n: d["operation"] for n, d in deleted.items()} == {comp: "delete", name: "delete"}
+        assert list(deleted[comp]["state"]) == ["value", "timestamp"]
+        assert list(deleted[name]["state"]) == ["value", "reason", "timestamp"]
+    finally:
+        for n in (comp, name):
+            try:
+                cw.delete_alarms(AlarmNames=[n])
+            except ClientError:
+                pass
+        eb.remove_targets(Rule=tag, Ids=["q"])
+        eb.delete_rule(Name=tag)
+        sqs.delete_queue(QueueUrl=q)
+
+
+def test_cloudwatch_alarm_event_shapes_second_capture(cw, eb, sqs):
+    """Metric math, percentile, Unit and DatapointsToAlarm in the event configuration, Enable/DisableAlarmActions
+    as updates, and an unchanged SetAlarmState leaving the alarm alone (AWS capture 2026-11-26, eu-north-1)."""
+    tag = f"cw-ev2-{_uuid_mod.uuid4().hex[:8]}"
+    q = sqs.create_queue(QueueName=tag)["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name=tag, EventPattern=json.dumps({
+        "source": ["aws.cloudwatch"], "resources": [{"prefix": f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{tag}"}]}))
+    eb.put_targets(Rule=tag, Targets=[{"Id": "q", "Arn": qarn}])
+
+    def events():
+        got = []
+        for _ in range(5):
+            msgs = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+            if not msgs and got:
+                break
+            for m in msgs:
+                got.append(json.loads(m["Body"]))
+                sqs.delete_message(QueueUrl=q, ReceiptHandle=m["ReceiptHandle"])
+        return got
+
+    math, ext, plain = f"{tag}-math", f"{tag}-extended", f"{tag}-plain"
+    try:
+        cw.put_metric_alarm(AlarmName=math, EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanThreshold",
+                            AlarmDescription="math alarm", Metrics=[
+                                {"Id": "m1", "MetricStat": {"Metric": {"Namespace": f"MS/{tag}", "MetricName": "A",
+                                                                       "Dimensions": [{"Name": "D", "Value": "v"}]},
+                                                            "Period": 60, "Stat": "Sum", "Unit": "Count"},
+                                 "ReturnData": False, "Label": "first"},
+                                {"Id": "m2", "MetricStat": {"Metric": {"Namespace": f"MS/{tag}", "MetricName": "B"},
+                                                            "Period": 60, "Stat": "Average"}, "ReturnData": False},
+                                {"Id": "e1", "Expression": "m1 + m2", "Label": "sum", "ReturnData": True}])
+        [created] = events()
+        config = created["detail"]["configuration"]
+        assert list(config) == ["evaluationPeriods", "threshold", "comparisonOperator", "metrics", "alarmName",
+                                "description", "actionsEnabled", "timestamp", "okActions", "alarmActions",
+                                "insufficientDataActions"]
+        assert config["metrics"] == [
+            {"id": "m1", "metricStat": {"metric": {"namespace": f"MS/{tag}", "name": "A", "dimensions": {"D": "v"}},
+                                        "period": 60, "stat": "Sum", "unit": "Count"},
+             "label": "first", "returnData": False},
+            {"id": "m2", "metricStat": {"metric": {"namespace": f"MS/{tag}", "name": "B", "dimensions": {}},
+                                        "period": 60, "stat": "Average"}, "returnData": False},
+            {"id": "e1", "expression": "m1 + m2", "label": "sum", "returnData": True}]
+
+        cw.put_metric_alarm(AlarmName=ext, Namespace=f"MS/{tag}", MetricName="Latency", ExtendedStatistic="p99",
+                            Dimensions=[{"Name": "Service", "Value": "api"}, {"Name": "Stage", "Value": "prod"}],
+                            Unit="Milliseconds", Period=60, EvaluationPeriods=3, DatapointsToAlarm=2, Threshold=250,
+                            ComparisonOperator="GreaterThanThreshold")
+        [created] = [e for e in events() if e["detail-type"] == "CloudWatch Alarm Configuration Change"]
+        config = created["detail"]["configuration"]
+        assert list(config) == ["evaluationPeriods", "datapointsToAlarm", "threshold", "comparisonOperator",
+                                "metrics", "alarmName", "actionsEnabled", "timestamp", "okActions", "alarmActions",
+                                "insufficientDataActions"]
+        [metric] = config["metrics"]
+        assert metric["metricStat"] == {
+            "metric": {"namespace": f"MS/{tag}", "name": "Latency", "dimensions": {"Service": "api", "Stage": "prod"}},
+            "period": 60, "stat": "p99", "unit": "Milliseconds"}
+
+        cw.put_metric_alarm(AlarmName=plain, Namespace=f"MS/{tag}", MetricName="Value", Statistic="Sum", Period=60,
+                            EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanOrEqualToThreshold",
+                            TreatMissingData="ignore")
+        [created] = events()
+        metric_id = created["detail"]["configuration"]["metrics"][0]["id"]
+        cw.set_alarm_state(AlarmName=plain, StateValue="ALARM", StateReason="with data",
+                           StateReasonData=json.dumps({"probe": "data"}))
+        events()
+        cw.set_alarm_state(AlarmName=plain, StateValue="OK", StateReason="without data")
+        [changed] = events()
+        assert changed["detail"]["previousState"]["reasonData"] == '{"probe": "data"}'
+        assert "reasonData" not in changed["detail"]["state"]
+        before = cw.describe_alarms(AlarmNames=[plain])["MetricAlarms"][0]
+        assert "StateReasonData" not in before
+        cw.set_alarm_state(AlarmName=plain, StateValue="OK", StateReason="same state, with data",
+                           StateReasonData=json.dumps({"probe": "same"}))
+        assert events() == []
+        after = cw.describe_alarms(AlarmNames=[plain])["MetricAlarms"][0]
+        assert (after["StateReason"], after.get("StateReasonData"), after["StateUpdatedTimestamp"]) == (
+            "without data", None, before["StateUpdatedTimestamp"])
+
+        cw.disable_alarm_actions(AlarmNames=[plain])
+        [disabled] = events()
+        detail = disabled["detail"]
+        assert (disabled["detail-type"], detail["operation"], list(detail["state"])) == (
+            "CloudWatch Alarm Configuration Change", "update", ["value", "timestamp"])
+        assert (detail["configuration"]["actionsEnabled"], detail["previousConfiguration"]["actionsEnabled"]) == (
+            False, True)
+        assert detail["configuration"]["metrics"][0]["id"] == metric_id
+        cw.enable_alarm_actions(AlarmNames=[plain])
+        [enabled] = events()
+        assert (enabled["detail"]["configuration"]["actionsEnabled"],
+                enabled["detail"]["previousConfiguration"]["actionsEnabled"]) == (True, False)
+        assert enabled["detail"]["configuration"]["metrics"][0]["id"] == metric_id
+    finally:
+        cw.delete_alarms(AlarmNames=[math, ext, plain])
+        eb.remove_targets(Rule=tag, Ids=["q"])
+        eb.delete_rule(Name=tag)
+        sqs.delete_queue(QueueUrl=q)

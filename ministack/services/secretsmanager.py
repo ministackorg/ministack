@@ -21,6 +21,7 @@ import re
 import secrets as stdlib_secrets
 import string
 import time
+from datetime import datetime, timedelta, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import spawn_background
@@ -358,6 +359,8 @@ def _apply_current_promotion(secret, new_vid):
         stages = secret["Versions"][old_curr_vid]["Stages"]
         if "AWSCURRENT" in stages:
             stages.remove("AWSCURRENT")
+        if "AWSPENDING" in stages:
+            stages.remove("AWSPENDING")
         if "AWSPREVIOUS" not in stages:
             stages.append("AWSPREVIOUS")
 
@@ -368,6 +371,10 @@ def _apply_current_promotion(secret, new_vid):
         if "AWSPENDING" in ver["Stages"]:
             ver["Stages"].remove("AWSPENDING")
         _emit_secret_label_updated(secret, "AWSCURRENT", new_vid)
+    if secret.get("RotationEnabled"):
+        # A new value set by hand counts as a rotation.
+        secret["LastRotatedDate"] = int(time.time())
+        _schedule_rotation(secret)
 
 
 def _publish_new_version(secret, secret_string=None, secret_binary=None):
@@ -588,6 +595,7 @@ async def handle_request(method, path, headers, body, query_params):
         "UntagResource": _untag_resource,
         "ListSecretVersionIds": _list_secret_version_ids,
         "RotateSecret": _rotate_secret,
+        "CancelRotateSecret": _cancel_rotate_secret,
         "GetRandomPassword": _get_random_password,
         "ReplicateSecretToRegions": _replicate_secret_to_regions,
         "RemoveRegionsFromReplication": _remove_regions_from_replication,
@@ -695,7 +703,7 @@ def _store_new_secret(name, secret_string=None, secret_binary=None, description=
         "LastChangedDate": now,
         "LastAccessedDate": None,
         "DeletedDate": None,
-        "RotationEnabled": False,
+        "RotationEnabled": None,
         "RotationLambdaARN": rotation_lambda_arn,
         "RotationRules": rotation_rules,
         "KmsKeyId": kms_key_id,
@@ -898,7 +906,9 @@ def _list_secrets(data):
             "LastAccessedDate": s.get("LastAccessedDate"),
             "Tags": s.get("Tags", []),
             "SecretVersionsToStages": _vid_to_stages(s),
-            "RotationEnabled": s.get("RotationEnabled", False),
+            "RotationEnabled": bool(s.get("RotationEnabled")),
+            "LastRotatedDate": s.get("LastRotatedDate"),
+            "NextRotationDate": s.get("NextRotationDate") if s.get("RotationEnabled") else None,
         }
         if s.get("DeletedDate"):
             entry["DeletedDate"] = s["DeletedDate"]
@@ -1085,7 +1095,10 @@ def _describe_secret(data):
         "LastAccessedDate": secret.get("LastAccessedDate"),
         "Tags": secret.get("Tags", []),
         "VersionIdsToStages": _vid_to_stages(secret),
-        "RotationEnabled": secret.get("RotationEnabled", False),
+        # Null until the secret is first configured for rotation.
+        "RotationEnabled": secret.get("RotationEnabled"),
+        "LastRotatedDate": secret.get("LastRotatedDate"),
+        "NextRotationDate": secret.get("NextRotationDate") if secret.get("RotationEnabled") else None,
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
@@ -1135,6 +1148,8 @@ def _put_secret_value(data):
     if "AWSCURRENT" in stages:
         _apply_current_promotion(secret, vid)
     else:
+        for _lbl in stages:
+            _remove_stage_everywhere(secret, _lbl, except_version_id=vid)
         secret["Versions"][vid]["Stages"] = list(stages)
         for _lbl in stages:
             if _lbl not in ("AWSCURRENT", "AWSPENDING", "AWSPREVIOUS"):
@@ -1324,6 +1339,105 @@ def _list_secret_version_ids(data):
     return json_response(resp)
 
 
+_RATE = re.compile(r"rate\((\d+) (hours?|days?)\)")
+
+
+def _rotation_rules_error(rules):
+    """The refusal RotateSecret returns for these RotationRules, or None (AWS captures 2026-11-26)."""
+    days, duration, expression = (rules.get(k) for k in ("AutomaticallyAfterDays", "Duration", "ScheduleExpression"))
+    invalid = []
+    if days is not None and not 1 <= int(days) <= 1000:
+        bound = "less than or equal to 1000" if int(days) > 1000 else "greater than or equal to 1"
+        invalid.append(f"Value '{days}' at 'rotationRules.automaticallyAfterDays' failed to satisfy constraint: "
+                       f"Member must have value {bound}")
+    if duration is not None:
+        if not re.fullmatch(r"[0-9]+h", duration):
+            invalid.append(f"Value '{duration}' at 'rotationRules.duration' failed to satisfy constraint: "
+                           "Member must satisfy regular expression pattern: [0-9]+h")
+        if not 2 <= len(duration) <= 3:
+            bound = "less than or equal to 3" if len(duration) > 3 else "greater than or equal to 2"
+            invalid.append(f"Value '{duration}' at 'rotationRules.duration' failed to satisfy constraint: "
+                           f"Member must have length {bound}")
+    if invalid:
+        count = "1 validation error" if len(invalid) == 1 else f"{len(invalid)} validation errors"
+        return error_response_json("ValidationException", f"{count} detected: " + "; ".join(invalid), 400)
+
+    def refuse(message):
+        return error_response_json("InvalidParameterException", message, 400)
+
+    if days is not None and expression:
+        return refuse("You cannot specify both rotation frequency and schedule expression together.")
+    if duration is not None and days is None and not expression:
+        return refuse("You must provide a schedule expression or rotation frequency when using the duration option.")
+    hours = int(duration[:-1]) if duration else None
+    if hours is not None and not 1 <= hours <= 24:
+        return refuse("Duration must be at least 1 hour, at most 24 hour.")
+    if expression:
+        rate = _RATE.fullmatch(expression)
+        if rate and rate.group(2).startswith("hour"):
+            if not 4 <= int(rate.group(1)) < 24:
+                return refuse("Rate in hour should be least 4 and less than 24.")
+            if hours is not None and hours > int(rate.group(1)):
+                return refuse("Duration cannot be greater than Rate in hour.")
+        elif rate:
+            if not 0 < int(rate.group(1)) <= 1000:
+                return refuse("Rate in day should be greater than 0 and less than 1000.")
+        else:
+            fields = _rotation_cron(expression)
+            if fields is None:
+                return refuse("Invalid schedule expression.")
+            if hours is not None and max(fields[1]) + hours > 24:
+                return refuse("Starting hour and duration must be within a day.")
+    return None
+
+
+def _rotation_cron(expression):
+    """Parsed cron() fields, or None. Rotation windows start on the hour and repeat within a year."""
+    from ministack.services import eventbridge
+
+    parts = expression[5:-1].split() if expression.startswith("cron(") and expression.endswith(")") else []
+    if len(parts) != 6 or parts[0] != "0" or parts[5] != "*":
+        return None
+    if parts[1].startswith("/"):
+        parts[1] = "0" + parts[1]
+    return eventbridge._parse_cron_fields(f"cron({' '.join(parts)})")
+
+
+def _rotation_schedule(rules, last_rotated):
+    """(AutomaticallyAfterDays, NextRotationDate) for these rules. NextRotationDate is the end of the next
+    rotation window: AWS capture 2026-11-26 and the RotationRules documentation."""
+    now = datetime.now(timezone.utc)
+    base = datetime.fromtimestamp(last_rotated, timezone.utc) if last_rotated else now
+    duration = rules.get("Duration")
+    window = timedelta(hours=int(duration[:-1])) if duration else None
+    expression = rules.get("ScheduleExpression")
+    rate = _RATE.fullmatch(expression) if expression else None
+    if rate and rate.group(2).startswith("hour"):
+        start = base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=int(rate.group(1)))
+        days, window = 1, window or timedelta(hours=1)
+    elif expression and not rate:
+        from ministack.services import eventbridge
+
+        start = eventbridge._cron_next_fire(_rotation_cron(expression), now)
+        if "/" in expression.split()[1]:
+            days, window = 1, window or timedelta(hours=1)
+        else:
+            days = (start.date() - now.date()).days
+    else:
+        days = int(rate.group(1)) if rate else int(rules["AutomaticallyAfterDays"])
+        start = base.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days)
+    end = start + window if window else start.replace(hour=0) + timedelta(days=1)
+    return days, int((end - timedelta(seconds=1)).timestamp())
+
+
+def _schedule_rotation(secret):
+    rules = secret.get("RotationRules")
+    if rules:
+        days, secret["NextRotationDate"] = _rotation_schedule(rules, secret.get("LastRotatedDate"))
+        secret["RotationRules"] = {"AutomaticallyAfterDays": days,
+                                   **{k: rules[k] for k in ("Duration", "ScheduleExpression") if rules.get(k)}}
+
+
 def _rotate_secret(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)
@@ -1339,42 +1453,82 @@ def _rotate_secret(data):
         )
     if _is_replica(secret):
         return _replica_mutation_error()
-
+    rules = data.get("RotationRules")
+    refused = _rotation_rules_error(rules) if rules else None
+    if refused:
+        return refused
     lambda_arn = data.get("RotationLambdaARN") or secret.get("RotationLambdaARN")
-    rotation_rules = data.get("RotationRules") or secret.get("RotationRules")
+    if not lambda_arn:
+        return error_response_json(
+            "InvalidRequestException", "No Lambda rotation function ARN is associated with this secret.", 400)
 
-    if lambda_arn:
-        secret["RotationLambdaARN"] = lambda_arn
-    if rotation_rules:
-        secret["RotationRules"] = rotation_rules
+    secret["RotationLambdaARN"] = lambda_arn
+    if rules:
+        secret["RotationRules"] = dict(rules)
+        _schedule_rotation(secret)
+    elif rules is not None:
+        # Empty rules drop the rules; the rotation date already scheduled stays.
+        secret["RotationRules"] = None
     secret["RotationEnabled"] = True
 
     vid = data.get("ClientRequestToken", new_uuid())
+    if data.get("RotateImmediately", True) is not False:
+        # The function gets createSecret, setSecret, testSecret and finishSecret and moves the stages itself.
+        steps = ("createSecret", "setSecret", "testSecret", "finishSecret")
+    else:
+        # testSecret alone, against an AWSPENDING version created for the test and removed after it.
+        steps = ("testSecret",)
+        current = _find_stage_version(secret, "AWSCURRENT")[1] or {}
+        _remove_stage_everywhere(secret, "AWSPENDING")
+        secret["Versions"][vid] = {"SecretString": current.get("SecretString"),
+                                   "SecretBinary": current.get("SecretBinary"), "CreatedDate": int(time.time()),
+                                   "Stages": ["AWSPENDING"], "_RotationTest": True}
+    secret["LastChangedDate"] = int(time.time())
     _sync_replicas(secret)
-    if secret.get("RotationLambdaARN"):
-        # The rotation runs asynchronously: the function gets createSecret, setSecret, testSecret and
-        # finishSecret in turn and moves the stages itself. RotateImmediately=false runs testSecret only.
-        steps = (("createSecret", "setSecret", "testSecret", "finishSecret")
-                 if data.get("RotateImmediately", True) is not False else ("testSecret",))
-        spawn_background(_run_rotation, secret["ARN"], secret["RotationLambdaARN"], vid, steps,
-                         thread_name="secretsmanager-rotation")
+    spawn_background(_run_rotation, secret, lambda_arn, vid, steps, thread_name="secretsmanager-rotation")
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
 
 
-def _run_rotation(secret_arn: str, lambda_arn: str, token: str, steps) -> None:
+def _run_rotation(secret, lambda_arn: str, token: str, steps) -> None:
     from ministack.services import lambda_svc
 
     record, config, _name = lambda_svc._get_func_record_for_ref(lambda_arn)
     if record is None or config is None:
-        logger.warning("RotateSecret: rotation function %s not found for %s", lambda_arn, secret_arn)
+        logger.warning("RotateSecret: rotation function %s not found for %s", lambda_arn, secret["ARN"])
         return
     exec_record = lambda_svc._execution_record_for_config(record, config)
     for step in steps:
-        event = {"ClientRequestToken": token, "RotationToken": new_uuid(), "SecretId": secret_arn, "Step": step}
+        event = {"ClientRequestToken": token, "RotationToken": new_uuid(), "SecretId": secret["ARN"], "Step": step}
         result = lambda_svc._execute_function_with_config_scope(exec_record, event)
         if result.get("error"):
-            logger.warning("RotateSecret: %s failed at %s: %s", secret_arn, step, result.get("body"))
+            logger.warning("RotateSecret: %s failed at %s: %s", secret["ARN"], step, result.get("body"))
             return
+    if "finishSecret" in steps:
+        secret["LastRotatedDate"] = int(time.time())
+        _schedule_rotation(secret)
+    elif secret["Versions"].get(token, {}).get("_RotationTest"):
+        del secret["Versions"][token]
+    _sync_replicas(secret)
+
+
+def _cancel_rotate_secret(data):
+    _, secret = _resolve(data.get("SecretId"))
+    if not secret:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "Secrets Manager can't find the specified secret.", 400,
+        )
+    if secret.get("DeletedDate"):
+        return error_response_json(
+            "InvalidRequestException",
+            "You can't perform this operation on the secret because it was marked for deletion.", 400,
+        )
+    if _is_replica(secret):
+        return _replica_mutation_error()
+    secret["RotationEnabled"] = False
+    secret["LastChangedDate"] = int(time.time())
+    _sync_replicas(secret)
+    return json_response({"ARN": secret["ARN"], "Name": secret["Name"]})
 
 
 def _get_random_password(data):

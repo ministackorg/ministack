@@ -31,8 +31,7 @@ from graphql import (
     validate,
 )
 from graphql.execution import ExecutionResult
-from graphql.language import FieldNode, InlineFragmentNode
-from graphql.language import NonNullTypeNode, OperationDefinitionNode
+from graphql.language import FieldNode, InlineFragmentNode, VariableNode
 from graphql.validation import MaxIntrospectionDepthRule, specified_rules
 
 logger = logging.getLogger("appsync")
@@ -94,10 +93,7 @@ def forget_schema(api_id: str | None = None):
         _schema_cache.pop(api_id, None)
 
 
-# AppSync validates with graphql-java, whose messages clients and tests match on.
-# graphql-core's wording for the same failures, rewritten to AppSync's. `{path}` is
-# the slash-joined field path graphql-java ends its messages with; the last item
-# says whether AppSync gives the error a location.
+# graphql-core's wording for these failures, rewritten to AppSync's (graphql-java); the bool keeps locations.
 _APPSYNC_WORDING = [
     (re.compile(r"^Unknown argument '(\w+)' on field '\w+\.\w+'\.$"),
      "Validation error of type UnknownArgument: Unknown field argument {0} @ '{path}'", True),
@@ -167,35 +163,18 @@ def _as_appsync_errors(errors, document=None):
     return out
 
 
-def _materialize_unset_variables(document, operation_name, variables):
-    """AppSync passes a declared-but-unset variable to the resolver as null.
-
-    graphql-core follows the spec and omits the argument instead, so a resolver
-    cannot tell "not sent" from "cleared". AppSync clients rely on the null: a
-    variable declared by the selected operation, absent from the request, without
-    a default and of a nullable type arrives as an explicit None. Non-null
-    variables are left alone so the spec's "was not provided" error stays.
-    """
-    operations = [d for d in document.definitions if isinstance(d, OperationDefinitionNode)]
-    if operation_name:
-        operations = [o for o in operations if o.name and o.name.value == operation_name]
-    if len(operations) != 1:
-        return variables
-    out = dict(variables)
-    for definition in operations[0].variable_definitions or ():
-        name = definition.variable.name.value
-        if name in out or definition.default_value is not None:
-            continue
-        if isinstance(definition.type, NonNullTypeNode):
-            continue
-        out[name] = None
-    return out
+def _unset_arguments_as_null(resolver, variables):
+    """AppSync gives an argument bound to an unsent variable as null; inside an input object it stays absent."""
+    def resolve(source, info, **args):
+        for arg in info.field_nodes[0].arguments:
+            if (isinstance(arg.value, VariableNode) and arg.value.name.value not in variables
+                    and arg.name.value not in args):
+                args[arg.name.value] = None
+        return resolver(source, info, **args)
+    return resolve
 
 
-def execute(api_id, sdl, query, variables, operation_name, field_resolver, context):
-# AppSync has no introspection-depth rule; it limits every operation by the API's
-# queryDepthLimit instead (below). graphql-core's rule rejects introspection that
-# AppSync answers.
+# AppSync has no introspection-depth rule, only queryDepthLimit.
 _VALIDATION_RULES = [rule for rule in specified_rules if rule is not MaxIntrospectionDepthRule]
 
 # What AppSync appends once when it cuts a selection at queryDepthLimit.
@@ -210,13 +189,7 @@ _DEPTH_LIMIT_ERROR = {
 
 
 class _DepthLimit:
-    """Middleware: a field deeper than `limit` levels is not resolved and comes back null.
-
-    AppSync applies queryDepthLimit while it executes, not as a validation error: the
-    fields within the limit resolve, the ones below it are null, and one error is added.
-    A field's depth is the number of field names in its response path, so fragments add
-    no level and introspection fields count like any other.
-    """
+    """Middleware: a field more than `limit` field names deep resolves to null and flags the error."""
 
     def __init__(self, limit):
         self.limit = limit
@@ -253,10 +226,10 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
     result: ExecutionResult = execute_sync(
         schema,
         document,
-        variable_values=_materialize_unset_variables(document, operation_name, variables or {}),
+        variable_values=variables or {},
         operation_name=operation_name,
         context_value=context,
-        field_resolver=field_resolver,
+        field_resolver=_unset_arguments_as_null(field_resolver, variables or {}),
         middleware=[depth_limit] if depth_limit else None,
     )
     errors = _as_appsync_errors(result.errors)
