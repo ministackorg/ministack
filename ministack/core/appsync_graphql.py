@@ -29,6 +29,7 @@ from graphql import (
     validate,
 )
 from graphql.execution import ExecutionResult
+from graphql.language import NonNullTypeNode, OperationDefinitionNode
 
 logger = logging.getLogger("appsync")
 
@@ -113,6 +114,31 @@ def _as_appsync_errors(errors):
     return out
 
 
+def _materialize_unset_variables(document, operation_name, variables):
+    """AppSync passes a declared-but-unset variable to the resolver as null.
+
+    graphql-core follows the spec and omits the argument instead, so a resolver
+    cannot tell "not sent" from "cleared". AppSync clients rely on the null: a
+    variable declared by the selected operation, absent from the request, without
+    a default and of a nullable type arrives as an explicit None. Non-null
+    variables are left alone so the spec's "was not provided" error stays.
+    """
+    operations = [d for d in document.definitions if isinstance(d, OperationDefinitionNode)]
+    if operation_name:
+        operations = [o for o in operations if o.name and o.name.value == operation_name]
+    if len(operations) != 1:
+        return variables
+    out = dict(variables)
+    for definition in operations[0].variable_definitions or ():
+        name = definition.variable.name.value
+        if name in out or definition.default_value is not None:
+            continue
+        if isinstance(definition.type, NonNullTypeNode):
+            continue
+        out[name] = None
+    return out
+
+
 def execute(api_id, sdl, query, variables, operation_name, field_resolver, context):
     """Parse, validate and execute one operation.
 
@@ -136,7 +162,7 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
     result: ExecutionResult = execute_sync(
         schema,
         document,
-        variable_values=variables or {},
+        variable_values=_materialize_unset_variables(document, operation_name, variables or {}),
         operation_name=operation_name,
         context_value=context,
         field_resolver=field_resolver,
