@@ -483,6 +483,8 @@ def _describe_stacks(params):
             f"<member>{_esc(c)}</member>" for c in s.get("Capabilities", []))
         deletion_mode_xml = (f"<DeletionMode>{s['DeletionMode']}</DeletionMode>"
                              if s.get("DeletionMode") else "")
+        # A nested stack reports its parent and its root, as AWS does.
+        nesting_xml = "".join(f"<{key}>{_esc(s[key])}</{key}>" for key in ("ParentId", "RootId") if s.get(key))
 
         members += (
             "<member>"
@@ -498,6 +500,7 @@ def _describe_stacks(params):
             f"{str(s.get('EnableTerminationProtection', False)).lower()}"
             "</EnableTerminationProtection>"
             f"{deletion_mode_xml}"
+            f"{nesting_xml}"
             f"<Capabilities>{caps_xml}</Capabilities>"
             f"<Parameters>{params_xml}</Parameters>"
             f"<Outputs>{outputs_xml}</Outputs>"

@@ -5073,7 +5073,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         "_resolved_params": param_values,
         "_conditions": _evaluate_conditions(template, param_values),
         "_parent_stack_name": parent_stack_name,
-        "RootId": _cr_stack_id(parent_stack_name),
+        # AWS: ParentId is the direct parent, RootId the top-level stack at every depth.
+        "RootId": _nested_root_id(parent_stack_name),
         "ParentId": _cr_stack_id(parent_stack_name),
         # The parent's acknowledgement covers every level of nesting, so a
         # child of this child reads the same set. Only the check needs it, so
@@ -5404,6 +5405,12 @@ def _stack_set_delete(physical_id, props):
 
 
 # --- CloudFormation Custom Resource ---
+
+def _nested_root_id(parent_stack_name: str) -> str:
+    """The top-level stack's id: the parent's RootId when the parent is itself nested."""
+    from ministack.services.cloudformation import _stacks
+    return (_stacks.get(parent_stack_name) or {}).get("RootId") or _cr_stack_id(parent_stack_name)
+
 
 def _cr_stack_id(stack_name: str) -> str:
     """Return the StackId for stack_name, falling back to a synthesised ARN."""
