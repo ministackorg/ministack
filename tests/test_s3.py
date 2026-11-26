@@ -14114,3 +14114,122 @@ def test_s3_sse_kms_needs_kms_permissions(auth):
         f"User: {user} is not authorized to perform: kms:Decrypt on resource: {key_arn} "
         "because no identity-based policy allows the kms:Decrypt action")
     assert routed_request(key, "s3", "HEAD", f"/{bucket}/enc")[0] == 200
+
+
+@contextlib.contextmanager
+def _s3_server(tmp_path, **env):
+    """A MiniStack server of its own on a free port, with ``env`` set and AUTH unset; yields its endpoint."""
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}"
+    server_env = {**os.environ, "IOT_MTLS_ENABLED": "0", "PERSIST_STATE": "0", "S3_PERSIST": "0", **env}
+    server_env.pop("AUTH", None)
+    log_path = tmp_path / "s3-server.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app", "--bind", f"127.0.0.1:{port}"],
+            cwd=Path(__file__).resolve().parents[1], env=server_env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    pytest.fail(f"Server exited: {log_path.read_text()}")
+                try:
+                    urllib.request.urlopen(f"{endpoint}/_ministack/health", timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                pytest.fail(f"Server did not start: {log_path.read_text()}")
+            yield endpoint
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def _presigned_put_status(url, headers):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=b"x", method="PUT", headers=headers)) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+def _presign_client(endpoint, access_key="test", secret_key="test"):
+    return boto3.client(
+        "s3", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def _write_once_url(client, bucket, key="once.txt"):
+    return client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key, "ContentType": "text/plain", "IfNoneMatch": "*"},
+        ExpiresIn=300)
+
+
+_WRITE_ONCE_HEADERS = {"Content-Type": "text/plain", "If-None-Match": "*"}
+
+
+def test_s3_presigned_url_refuses_a_request_without_a_signed_header_with_auth_off(tmp_path):
+    """S3 answers 403 SignatureDoesNotMatch when a header named in X-Amz-SignedHeaders is not sent, and a
+    second write of the same key with the headers as signed is 412."""
+    with _s3_server(tmp_path) as endpoint:
+        client = _presign_client(endpoint)
+        bucket = f"presign-omit-{uuid.uuid4().hex[:8]}"
+        client.create_bucket(Bucket=bucket)
+        url = _write_once_url(client, bucket)
+
+        status, body = _presigned_put_status(url, {"Content-Type": "text/plain"})
+        assert status == 403
+        assert "<Code>SignatureDoesNotMatch</Code>" in body
+        assert client.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
+
+        assert _presigned_put_status(url, _WRITE_ONCE_HEADERS)[0] == 200
+        assert _presigned_put_status(url, _WRITE_ONCE_HEADERS)[0] == 412
+
+
+def test_s3_presigned_signed_header_check_without_auth_keeps_any_local_key_working(tmp_path):
+    """The check needs no secret, so a URL presigned with an unknown access key or a wrong secret still works
+    with AUTH off as long as the signed headers are sent."""
+    with _s3_server(tmp_path) as endpoint:
+        good = _presign_client(endpoint)
+        bucket = f"presign-keys-{uuid.uuid4().hex[:8]}"
+        good.create_bucket(Bucket=bucket)
+
+        for index, client in enumerate((_presign_client(endpoint, "unknownkey", "unknownsecret"),
+                                        _presign_client(endpoint, "test", "not-the-secret"))):
+            url = _write_once_url(client, bucket, f"key-{index}.txt")
+            assert _presigned_put_status(url, {"Content-Type": "text/plain"})[0] == 403
+            assert _presigned_put_status(url, _WRITE_ONCE_HEADERS)[0] == 200
+
+        params = {"Bucket": bucket, "Key": "key-0.txt"}
+        unknown = _presign_client(endpoint, "unknownkey", "unknownsecret")
+        with urllib.request.urlopen(unknown.generate_presigned_url("get_object", Params=params, ExpiresIn=300)) as r:
+            assert r.status == 200
+
+
+def test_s3_presigned_changed_signed_header_value_is_accepted_without_verification(tmp_path):
+    """Without S3_VERIFY_PRESIGNED_SIGNATURES the signature is not recomputed, so a changed value of a signed
+    header passes. The check covers only a header that is missing."""
+    with _s3_server(tmp_path) as endpoint:
+        client = _presign_client(endpoint)
+        bucket = f"presign-value-{uuid.uuid4().hex[:8]}"
+        client.create_bucket(Bucket=bucket)
+        url = client.generate_presigned_url(
+            "put_object", Params={"Bucket": bucket, "Key": "up.png", "ContentType": "image/png"}, ExpiresIn=300)
+
+        assert _presigned_put_status(url, {"Content-Type": "text/plain"})[0] == 200

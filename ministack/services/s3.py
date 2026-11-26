@@ -2681,6 +2681,20 @@ def _expired_error(amz_date: str, expires: str) -> tuple:
     return 403, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
+def _omits_signed_header(headers, signed_headers):
+    """True when a header named in ``X-Amz-SignedHeaders`` is absent from the request.
+
+    ``headers`` is keyed in lower case. ``host`` (and the HTTP/2 ``:authority``) is not
+    checked: the transport always supplies it, and the signature calculation reads it the
+    same way.
+    """
+    for name in signed_headers.split(";"):
+        name = name.strip().lower()
+        if name and name not in ("host", ":authority") and name not in headers:
+            return True
+    return False
+
+
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
@@ -2769,6 +2783,11 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     if not AUTH:
         # With AUTH off a presigned URL is trusted like a header-signed request:
         # its key selects the tenant, and the credential and signature are not checked.
+        # A request that omits a header the URL signed is refused anyway. That needs no
+        # secret: whatever key signed the URL, a correctly signed request carries every
+        # signed header, so a URL presigned with an unknown key or a wrong secret still works.
+        if _omits_signed_header(headers, signed_headers):
+            return _bad_signature()
         return None
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
