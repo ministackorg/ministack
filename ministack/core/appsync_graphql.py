@@ -18,6 +18,7 @@ schema change invalidates it and nothing else pays for the parse.
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 
@@ -31,6 +32,8 @@ from graphql import (
 )
 from graphql.execution import ExecutionResult
 from graphql.language import FieldNode, InlineFragmentNode
+from graphql.language import NonNullTypeNode, OperationDefinitionNode
+from graphql.validation import MaxIntrospectionDepthRule, specified_rules
 
 logger = logging.getLogger("appsync")
 
@@ -164,7 +167,69 @@ def _as_appsync_errors(errors, document=None):
     return out
 
 
+def _materialize_unset_variables(document, operation_name, variables):
+    """AppSync passes a declared-but-unset variable to the resolver as null.
+
+    graphql-core follows the spec and omits the argument instead, so a resolver
+    cannot tell "not sent" from "cleared". AppSync clients rely on the null: a
+    variable declared by the selected operation, absent from the request, without
+    a default and of a nullable type arrives as an explicit None. Non-null
+    variables are left alone so the spec's "was not provided" error stays.
+    """
+    operations = [d for d in document.definitions if isinstance(d, OperationDefinitionNode)]
+    if operation_name:
+        operations = [o for o in operations if o.name and o.name.value == operation_name]
+    if len(operations) != 1:
+        return variables
+    out = dict(variables)
+    for definition in operations[0].variable_definitions or ():
+        name = definition.variable.name.value
+        if name in out or definition.default_value is not None:
+            continue
+        if isinstance(definition.type, NonNullTypeNode):
+            continue
+        out[name] = None
+    return out
+
+
 def execute(api_id, sdl, query, variables, operation_name, field_resolver, context):
+# AppSync has no introspection-depth rule; it limits every operation by the API's
+# queryDepthLimit instead (below). graphql-core's rule rejects introspection that
+# AppSync answers.
+_VALIDATION_RULES = [rule for rule in specified_rules if rule is not MaxIntrospectionDepthRule]
+
+# What AppSync appends once when it cuts a selection at queryDepthLimit.
+_DEPTH_LIMIT_ERROR = {
+    "path": [],
+    "data": None,
+    "errorType": "QueryDepthLimitReached",
+    "errorInfo": None,
+    "locations": [],
+    "message": "Query depth limit reached.",
+}
+
+
+class _DepthLimit:
+    """Middleware: a field deeper than `limit` levels is not resolved and comes back null.
+
+    AppSync applies queryDepthLimit while it executes, not as a validation error: the
+    fields within the limit resolve, the ones below it are null, and one error is added.
+    A field's depth is the number of field names in its response path, so fragments add
+    no level and introspection fields count like any other.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.reached = False
+
+    def resolve(self, next_, root, info, **args):
+        if sum(isinstance(key, str) for key in info.path.as_list()) > self.limit:
+            self.reached = True
+            return None
+        return next_(root, info, **args)
+
+
+def execute(api_id, sdl, query, variables, operation_name, field_resolver, context, query_depth_limit=0):
     """Parse, validate and execute one operation.
 
     `field_resolver(source, info, **args)` is called for every field, and is
@@ -180,16 +245,21 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
 
     # Validation is the step the regex could never do: an unknown field or a
     # mistyped variable is refused here instead of resolving to null.
-    errors = validate(schema, document)
+    errors = validate(schema, document, _VALIDATION_RULES)
     if errors:
         return None, _as_appsync_errors(errors, document)
 
+    depth_limit = _DepthLimit(query_depth_limit) if query_depth_limit else None
     result: ExecutionResult = execute_sync(
         schema,
         document,
-        variable_values=variables or {},
+        variable_values=_materialize_unset_variables(document, operation_name, variables or {}),
         operation_name=operation_name,
         context_value=context,
         field_resolver=field_resolver,
+        middleware=[depth_limit] if depth_limit else None,
     )
-    return result.data, _as_appsync_errors(result.errors)
+    errors = _as_appsync_errors(result.errors)
+    if depth_limit and depth_limit.reached:
+        errors.insert(0, copy.deepcopy(_DEPTH_LIMIT_ERROR))
+    return result.data, errors
