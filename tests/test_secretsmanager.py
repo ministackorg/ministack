@@ -1266,6 +1266,37 @@ def test_secretsmanager_kms_key_id_on_update(sm):
     assert resp["KmsKeyId"] == "alias/other-key"
 
 
+def test_secretsmanager_create_without_value_checks_kms_key_state(sm, kms_client):
+    """CreateSecret without a value is refused under a disabled, pending-deletion or pending-import key, like one
+    with a value (AWS capture)."""
+    key = kms_client.create_key(Description="sm-empty-key-state")["KeyMetadata"]["Arn"]
+    name = f"sm-empty-key-state-{_uuid_mod.uuid4().hex[:8]}"
+
+    kms_client.disable_key(KeyId=key)
+    with pytest.raises(ClientError) as exc:
+        sm.create_secret(Name=name, KmsKeyId=key)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "The operation failed because the specified KMS key is disabled."
+
+    kms_client.enable_key(KeyId=key)
+    kms_client.schedule_key_deletion(KeyId=key, PendingWindowInDays=7)
+    with pytest.raises(ClientError) as exc:
+        sm.create_secret(Name=name, KmsKeyId=key)
+    assert exc.value.response["Error"]["Code"] == "PreconditionNotMetException"
+    assert exc.value.response["Error"]["Message"].startswith(
+        f"{key} is pending deletion. (Service: AWSKMS; Status Code: 400; Error Code: KMSInvalidStateException; "
+    )
+
+    external = kms_client.create_key(Description="sm-empty-key-import", Origin="EXTERNAL")["KeyMetadata"]["Arn"]
+    with pytest.raises(ClientError) as exc:
+        sm.create_secret(Name=name, KmsKeyId=external)
+    assert exc.value.response["Error"]["Code"] == "PreconditionNotMetException"
+    assert exc.value.response["Error"]["Message"].startswith(
+        f"{external} is pending import. (Service: AWSKMS; Status Code: 400; Error Code: KMSInvalidStateException; "
+    )
+    kms_client.schedule_key_deletion(KeyId=external, PendingWindowInDays=7)
+
+
 def test_secretsmanager_get_by_partial_arn(sm):
     """GetSecretValue with a partial ARN (no random suffix) must resolve the secret."""
     import uuid as _uuid

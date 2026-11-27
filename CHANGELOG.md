@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Secrets Manager — `CreateSecret` without a value and the KMS key state** — `CreateSecret` with no `SecretString` or `SecretBinary` succeeded while the secret's key was disabled, pending deletion or pending import. It now answers `InvalidParameterException` (disabled) or `PreconditionNotMetException` (pending deletion, pending import), as it does with a value. Contributed by @kharabasz.
+
 ## [1.5.45] — 2026-11-26
 
 ### Added
