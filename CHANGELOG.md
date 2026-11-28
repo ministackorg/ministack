@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — `RemoveFromGlobalCluster` for a missing cluster in another region** — `RemoveFromGlobalCluster` with the ARN of a cluster that does not exist answered `404 DBClusterNotFoundFault` when the ARN named a region other than the request's. It now answers `400 InvalidParameterValue` "Cluster <arn> is not found in global cluster <id>", as it already did for the request's own region. Matches real AWS (us-east-2). The Terraform AWS provider accepts only this answer when it deletes an `aws_rds_global_cluster` with `force_destroy = true` after its member clusters are gone. Contributed by @kharabasz.
+
 ## [1.5.45] — 2026-11-26
 
 ### Added

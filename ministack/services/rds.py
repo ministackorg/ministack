@@ -9525,8 +9525,7 @@ def _remove_from_global_cluster(p):
         )
         if not member:
             if (not cluster and parsed_member and parsed_member[1] == "cluster"
-                    and parsed_member[0].account_id == get_account_id()
-                    and parsed_member[0].region == get_region()):
+                    and parsed_member[0].account_id == get_account_id()):
                 return _error("InvalidParameterValue",
                     f"Cluster {db_cluster_arn} is not found in global cluster "
                     f"{gc['GlobalClusterIdentifier']}", 400)
