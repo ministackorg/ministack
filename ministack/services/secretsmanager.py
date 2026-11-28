@@ -729,10 +729,9 @@ def _create_secret(data):
             "ResourceExistsException",
             f"The operation failed because the secret {name} already exists.", 400,
         )
-    if data.get("SecretString") is not None or data.get("SecretBinary") is not None:
-        kms_error = _kms_value_error(data.get("KmsKeyId"), "create")
-        if kms_error:
-            return kms_error
+    kms_error = _kms_value_error(data.get("KmsKeyId"), "create")
+    if kms_error:
+        return kms_error
 
     arn, vid = _store_new_secret(
         name,
